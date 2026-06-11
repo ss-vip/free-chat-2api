@@ -71,14 +71,8 @@ export async function initDB(db) {
   }
   if (currentVersion < 7) {
     /* Remove deprecated providers */
-    await db.prepare("DELETE FROM providers WHERE type IN ('perfectassistant', 'chat2api')").run()
+    await db.prepare("DELETE FROM providers WHERE type IN ('perfectassistant', 'chat2api', 'gemini')").run()
     await db.prepare("DELETE FROM providers WHERE name = 'Chat2API Free'").run()
-    const existing = await db.prepare("SELECT id FROM providers WHERE type = 'gemini'").first()
-    if (!existing) {
-      await db.prepare(
-        "INSERT INTO providers (name, base_url, type, models, priority, enabled) VALUES (?, ?, ?, ?, ?, ?)"
-      ).bind('Gemini Free', '', 'gemini', JSON.stringify(['gemini-3.5-flash', 'gemini-3.5-flash-thinking', 'gemini-flash-lite', 'gemini-auto']), 0, 1).run()
-    }
     await db.prepare('UPDATE schema_meta SET version = 7 WHERE id = 1').run()
   }
   if (currentVersion < 8) {

@@ -1,5 +1,3 @@
-const GEMINI_DEFAULT_URL = 'https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate?bl=boq_assistant-bard-web-server_20260525.09_p0&hl=en&_reqid=1&rt=c'
-
 export function sanitizeProvider(provider) {
   if (!provider) return provider
   const { api_key, ...rest } = provider
@@ -84,9 +82,6 @@ export async function proxyWithFallback(providers, model, path, payload, stream)
 export async function proxyRequest(provider, path, payload, stream) {
   if (provider.type === 'chatwithfiction') {
     return proxyChatWithFiction(provider, payload, stream)
-  }
-  if (provider.type === 'gemini') {
-    return proxyGemini(provider, payload, stream)
   }
   const url = provider.base_url.replace(/\/+$/, '') + '/' + path.replace(/^\/+/, '')
   const headers = { 'Content-Type': 'application/json' }
@@ -220,49 +215,6 @@ async function proxyChatWithFiction(provider, payload, stream) {
   }
 }
 
-function buildGeminiBody(messages) {
-  const systemParts = messages.filter(m => m.role === 'system').map(m => m.content || '').join('\n')
-  const conversation = []
-  for (const msg of messages) {
-    if (msg.role === 'system') continue
-    if (msg.role === 'user') conversation.push([msg.content || '', 0, null, null, null, null, 0])
-    else if (msg.role === 'assistant') conversation.push([null, 0, null, null, msg.content || '', null, 0])
-  }
-  if (!conversation.length) conversation.push(['', 0, null, null, null, null, 0])
-  const last = conversation[conversation.length - 1]
-  if (last[4] !== null && last[4] !== undefined) {
-    conversation.push([systemParts || 'Continue', 0, null, null, null, null, 0])
-  } else if (systemParts && conversation.length === 1) {
-    last[0] = systemParts + '\n\n' + (last[0] || '')
-  }
-  const inner = JSON.stringify([null, [...conversation, ['en']]])
-  return 'f.req=' + encodeURIComponent(JSON.stringify([null, inner]))
-}
-
-function parseGeminiResponse(raw) {
-  let text = ''
-  for (const line of raw.split('\n')) {
-    const cleaned = line.replace(/^\)\]\}'/, '').trim()
-    if (!cleaned) continue
-    try {
-      const data = JSON.parse(cleaned)
-      const chunks = Array.isArray(data) ? data : [data]
-      for (const chunk of chunks) {
-        const payload = chunk?.[0]?.[2]
-        if (typeof payload !== 'string') continue
-        try {
-          const parsed = JSON.parse(payload)
-          if (typeof parsed?.[0] === 'string') text += parsed[0]
-          else if (typeof parsed?.[4]?.[0]?.[1] === 'string') text += parsed[4][0][1]
-        } catch {
-          if (payload.length > 2) text += payload
-        }
-      }
-    } catch {}
-  }
-  return text.trim() || raw.trim()
-}
-
 function makeCompletionId() {
   return 'chatcmpl-' + (crypto.randomUUID?.()?.slice(0, 8) || Math.random().toString(36).slice(2))
 }
@@ -319,30 +271,6 @@ function openAIStreamResponse(model, text, toolCall) {
   })
 }
 
-async function proxyGemini(provider, payload, stream) {
-  const messages = payload.messages || []
-  const tools = payload.tools || payload.functions || []
-  const url = provider.base_url || GEMINI_DEFAULT_URL
-  const model = payload.model || 'gemini-auto'
-
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: buildGeminiBody(messages),
-    signal: AbortSignal.timeout(60000)
-  })
-
-  if (!resp.ok) {
-    throw new Error('Gemini error: ' + resp.status + ' ' + (await resp.text()))
-  }
-
-  const text = parseGeminiResponse(await resp.text())
-  const toolCall = tools.length ? tryExtractToolCall(text) : null
-
-  if (stream) return openAIStreamResponse(model, text, toolCall)
-  return openAICompletion(model, text, toolCall)
-}
-
 export async function testProviderConnection(provider) {
   if (provider.type === 'chatwithfiction') {
     try {
@@ -352,23 +280,9 @@ export async function testProviderConnection(provider) {
         body: JSON.stringify({ prevMessages: [{ type: 'AI', content: 'test' }, { type: 'USER', content: 'hi' }], prompt: 'hi' }),
         signal: AbortSignal.timeout(10000)
       })
-      return { ok: resp.ok, status: resp.status }
-    } catch (e) {
-      return { ok: false, error: e.message }
-    }
-  }
-  if (provider.type === 'gemini') {
-    try {
-      const url = provider.base_url || GEMINI_DEFAULT_URL
-      const resp = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: buildGeminiBody([{ role: 'user', content: 'hi' }]),
-        signal: AbortSignal.timeout(10000),
-      })
       if (!resp.ok) return { ok: false, status: resp.status }
       const text = await resp.text()
-      return { ok: text.includes('wrb.fr'), status: 200 }
+      return { ok: text.length > 0, status: 200 }
     } catch (e) {
       return { ok: false, error: e.message }
     }

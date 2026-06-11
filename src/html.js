@@ -228,13 +228,12 @@ body{background:var(--bs-dark);min-height:100vh}
             <select class="form-select" id="providerType" onchange="onProviderTypeChange()">
               <option value="openai">openai</option>
               <option value="chatwithfiction">chatwithfiction</option>
-              <option value="gemini">gemini</option>
             </select>
           </div>
           <div class="col-12">
             <label class="form-label">API 網址</label>
             <input type="text" class="form-control" id="providerBaseUrl" placeholder="https://api.example.com/v1">
-            <div class="form-text text-secondary" id="providerBaseUrlHint">gemini 類型可留空使用預設端點</div>
+            <div class="form-text text-secondary" id="providerBaseUrlHint">必填（例如 https://api.openai.com/v1）</div>
           </div>
           <div class="col-12">
             <label class="form-label">API Key</label>
@@ -423,9 +422,6 @@ function getProviderModal() {
 }
 
 function onProviderTypeChange() {
-  const type = document.getElementById('providerType').value
-  const hint = document.getElementById('providerBaseUrlHint')
-  hint.textContent = type === 'gemini' ? 'gemini 類型可留空使用預設端點' : '必填（例如 https://api.openai.com/v1）'
 }
 
 function parseModelsInput(value) {
@@ -468,7 +464,7 @@ async function saveProvider() {
   const errEl = document.getElementById('providerFormError')
 
   if (!name) { errEl.textContent = '請輸入名稱'; return }
-  if (!base_url && type !== 'gemini') { errEl.textContent = '請輸入 API 網址'; return }
+  if (!base_url) { errEl.textContent = '請輸入 API 網址'; return }
   errEl.textContent = ''
 
   const body = { name, type, base_url, models, priority, enabled }

@@ -114,8 +114,8 @@ app.post('/api/providers', async (c) => {
   if (!(await requireAuth(c))) return c.json({ error: '未登入' }, 401)
   const data = await c.req.json()
   if (!data.name) return c.json({ error: 'name 為必填' }, 400)
-  if (!data.base_url && data.type !== 'gemini') {
-    return c.json({ error: 'base_url 為必填（gemini 類型除外）' }, 400)
+  if (!data.base_url) {
+    return c.json({ error: 'base_url 為必填' }, 400)
   }
   const provider = await createProvider(c.env.DB, data)
   return c.json(sanitizeProvider(provider))
