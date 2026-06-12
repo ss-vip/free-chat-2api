@@ -38,28 +38,78 @@ export function findProvidersForModel(providers, model) {
   return fallback
 }
 
+function extractToolDef(t) {
+  let name, description, parameters
+  if (t.type === 'function' && t.function) {
+    name = t.function.name; description = t.function.description; parameters = t.function.parameters
+  } else if (t.name) {
+    name = t.name; description = t.description || ''; parameters = t.parameters || t.inputSchema
+  } else {
+    return null
+  }
+  return { name, description: description || '', parameters: parameters || {} }
+}
+
 function buildToolPrompt(tools) {
   if (!tools?.length) return ''
-  return '\n\nYou have access to the following tools. When you need to use a tool, respond with ONLY a JSON object (no markdown, no extra text):\n' + tools.map(t => {
-    if (t.type === 'function') {
-      return `- ${t.function.name}: ${t.function.description || ''}  parameters: ${JSON.stringify(t.function.parameters)}`
-    }
-    return ''
-  }).filter(Boolean).join('\n') + '\n\nResponse format: {"name":"tool_name","arguments":{"key":"value"}}'
+  const list = tools.map(extractToolDef).filter(Boolean).map(({ name, description, parameters }) => {
+    const entries = parameters?.properties ? Object.entries(parameters.properties) : []
+    const requiredKeys = parameters?.required || []
+    const args = entries.map(([k, v]) => `${k}: ${v.type || 'any'}${v.description ? ' // ' + v.description : ''}${requiredKeys.includes(k) ? ' (required)' : ''}`).join('\n  ')
+    const example = '{"name":"' + name + '","arguments":{' + entries.map(([k]) => '"' + k + '":"..."').join(',') + '}}'
+    return '- ' + name + '(' + entries.map(([k]) => k).join(', ') + ')' + (description ? ': ' + description : '') + '\n  ' + args + '\n  Example: ' + example
+  }).join('\n\n')
+  return '\n[SYSTEM] You have tools available. To call one, output EXACTLY:\n' + list + '\n\nOnly output JSON when calling a tool. Otherwise, respond normally.[/SYSTEM]'
+}
+
+function buildArkoToolPrompt(tools) {
+  if (!tools?.length) return ''
+  const toolDefs = tools.map(extractToolDef).filter(Boolean).map(({ name, description, parameters }) => {
+    const entries = parameters?.properties ? Object.entries(parameters.properties) : []
+    const requiredKeys = parameters?.required || []
+    const paramText = entries.map(([k, v]) => {
+      const req = requiredKeys.includes(k) ? ' [REQUIRED]' : ' [optional]'
+      const desc = v.description ? ': ' + v.description : ''
+      return '  - ' + k + ' (' + (v.type || 'any') + ')' + desc + req
+    }).join('\n')
+    return '* ' + name + ': ' + description + '\n' + (paramText || '  (no parameters)')
+  }).join('\n\n')
+  if (!toolDefs) return ''
+  return '[Available Tools]\n' + toolDefs + '\n\n[Response Format]\nWhen you need to call a tool, respond ONLY with JSON: {"name":"<tool_name>","arguments":{...}}\nWhen no tool is needed, respond normally.\n---'
 }
 
 function tryExtractToolCall(text) {
+  if (!text) return null
+  const tryParse = (s) => {
+    try {
+      const obj = JSON.parse(s)
+      if (obj?.name && obj?.arguments) {
+        return { id: 'call_' + (crypto.randomUUID?.()?.slice(0, 8) || Math.random().toString(36).slice(2, 10)), type: 'function', function: { name: obj.name, arguments: typeof obj.arguments === 'string' ? obj.arguments : JSON.stringify(obj.arguments) } }
+      }
+      if (obj?.call) {
+        const args = { ...obj }; delete args.call
+        return { id: 'call_' + (crypto.randomUUID?.()?.slice(0, 8) || Math.random().toString(36).slice(2, 10)), type: 'function', function: { name: obj.call, arguments: JSON.stringify(args) } }
+      }
+    } catch {}
+    return null
+  }
   const cleaned = text.replace(/```(?:json)?\s*([\s\S]*?)```/g, '$1').trim()
-  try {
-    const obj = JSON.parse(cleaned)
-    if (obj?.name && obj?.arguments) {
-      return { id: 'call_' + (crypto.randomUUID?.()?.slice(0, 8) || Math.random().toString(36).slice(2, 10)), type: 'function', function: { name: obj.name, arguments: typeof obj.arguments === 'string' ? obj.arguments : JSON.stringify(obj.arguments) } }
+  const r = tryParse(cleaned)
+  if (r) return r
+  let start = -1, depth = 0
+  for (let i = 0; i < cleaned.length; i++) {
+    if (cleaned[i] === '{') {
+      if (start === -1) start = i
+      depth++
+    } else if (cleaned[i] === '}') {
+      depth--
+      if (depth === 0 && start !== -1) {
+        const r2 = tryParse(cleaned.slice(start, i + 1))
+        if (r2) return r2
+        start = -1
+      }
     }
-    if (obj?.call) {
-      const args = { ...obj }; delete args.call
-      return { id: 'call_' + (crypto.randomUUID?.()?.slice(0, 8) || Math.random().toString(36).slice(2, 10)), type: 'function', function: { name: obj.call, arguments: JSON.stringify(args) } }
-    }
-  } catch {}
+  }
   return null
 }
 
@@ -83,6 +133,27 @@ export async function proxyRequest(provider, path, payload, stream) {
   if (provider.type === 'chatwithfiction') {
     return proxyChatWithFiction(provider, payload, stream)
   }
+  if (provider.type === 'arko') {
+    return proxyArko(provider, payload, stream)
+  }
+  const tools = payload.tools || payload.functions || []
+  const toolPrompt = buildToolPrompt(tools)
+  const hasTools = !!toolPrompt
+  const simPayload = hasTools ? { ...payload } : payload
+  if (hasTools) {
+    const msgs = [...(payload.messages || [])]
+    const sysIdx = msgs.findIndex((m) => m.role === 'system')
+    if (sysIdx >= 0) {
+      msgs[sysIdx] = { ...msgs[sysIdx], content: msgs[sysIdx].content + '\n\n' + toolPrompt }
+    } else {
+      msgs.unshift({ role: 'system', content: toolPrompt })
+    }
+    simPayload.messages = msgs
+    delete simPayload.tools
+    delete simPayload.functions
+    delete simPayload.tool_choice
+    simPayload.stream = false
+  }
   const url = provider.base_url.replace(/\/+$/, '') + '/' + path.replace(/^\/+/, '')
   const headers = { 'Content-Type': 'application/json' }
   if (provider.api_key) {
@@ -91,12 +162,20 @@ export async function proxyRequest(provider, path, payload, stream) {
   const resp = await fetch(url, {
     method: 'POST',
     headers,
-    body: JSON.stringify(payload),
+    body: JSON.stringify(simPayload),
     signal: AbortSignal.timeout(60000)
   })
   if (!resp.ok) {
     const text = await resp.text()
     throw new Error('Provider error ' + resp.status + ': ' + text)
+  }
+  if (hasTools) {
+    const json = await resp.json()
+    const content = json?.choices?.[0]?.message?.content || ''
+    const toolCall = tryExtractToolCall(content)
+    const model = payload.model || 'unknown'
+    if (stream) return openAIStreamResponse(model, content, toolCall)
+    return openAICompletion(model, content, toolCall)
   }
   if (stream) {
     const { readable, writable } = new TransformStream()
@@ -106,6 +185,151 @@ export async function proxyRequest(provider, path, payload, stream) {
     })
   }
   return await resp.json()
+}
+
+async function proxyArko(provider, payload, stream) {
+  const messages = payload.messages || []
+  const hasTools = !!(payload.tools?.length || payload.functions?.length)
+  const tools = payload.tools || payload.functions || []
+  const toolPromptStr = buildArkoToolPrompt(tools)
+  const toolsActive = hasTools && !!toolPromptStr && (payload.tool_choice || 'auto') !== 'none'
+  const lastMsg = messages[messages.length - 1] || {}
+  const model = payload.model || 'arko'
+  const now = Math.floor(Date.now() / 1000)
+  const cidStr = (uuid) => 'chatcmpl-' + (uuid?.slice(0, 8) || Math.random().toString(36).slice(2, 10))
+  const writeChunks = async (writer, encoder, chunks, extraCid) => {
+    if (extraCid) await writer.write(encoder.encode('data: ' + JSON.stringify({ type: 'cid', cid: extraCid }) + '\n\n'))
+    for (const chunk of chunks) {
+      await writer.write(encoder.encode('data: ' + JSON.stringify({ id: cidStr(crypto.randomUUID?.()), object: 'chat.completion.chunk', created: now, model, choices: chunk.choices }) + '\n\n'))
+    }
+    await writer.write(encoder.encode('data: [DONE]\n\n'))
+    await writer.close()
+  }
+  let aid
+  try { aid = JSON.parse(provider.models)[0] } catch {}
+  if (!aid) aid = payload.model
+  const url = provider.base_url.replace(/\/+$/, '') + '/v3/messages'
+  const headers = { 'Content-Type': 'application/json' }
+  if (provider.api_key) headers['Authorization'] = 'Bearer ' + provider.api_key
+  const toolChoice = payload.tool_choice
+  if (toolsActive && lastMsg.role === 'tool') {
+    const lastUserMsg = [...messages].slice(0, messages.length - 1).reverse().find((m) => m.role === 'user')
+    const originalUser = lastUserMsg?.content || messages.find((m) => m.role === 'user')?.content || ''
+    const toolResult = lastMsg.content || ''
+    const toolName = lastMsg.name || lastMsg.tool_call_id || 'tool'
+    const content2 = '[Context]\nUser asked: ' + originalUser + '\n\nTool called: ' + toolName + '\nResult: ' + toolResult + '\n[/Context]\n\nPlease respond to the user based on the tool result above.'
+    const body2 = { content: content2, stream: false }
+    if (payload.cid) body2.cid = payload.cid
+    else body2.aid = aid
+    const resp2 = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body2), signal: AbortSignal.timeout(60000) })
+    if (!resp2.ok) throw new Error('Arko error ' + resp2.status + ': ' + (await resp2.text()))
+    const json2 = await resp2.json()
+    const assistantMsg2 = json2?.data?.messages?.find((m) => m.role === 'assistant')
+    const text2 = assistantMsg2?.content || ''
+    const dataCid2 = json2?.data?.chat?.id
+    if (stream) {
+      const { readable, writable } = new TransformStream()
+      const writer = writable.getWriter()
+      const encoder = new TextEncoder()
+      ;(async () => writeChunks(writer, encoder, [
+        { choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] },
+        { choices: [{ index: 0, delta: { content: text2 }, finish_reason: null }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }
+      ], dataCid2))()
+      return new Response(readable, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' } })
+    }
+    const result2 = { id: cidStr(crypto.randomUUID?.()), object: 'chat.completion', created: now, model, choices: [{ index: 0, message: { role: 'assistant', content: text2 }, finish_reason: 'stop' }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } }
+    if (dataCid2) result2._cid = dataCid2
+    return result2
+  }
+  const lastUser = [...messages].reverse().find((m) => m.role === 'user')
+  const baseContent = lastUser?.content || ''
+  const content = toolPromptStr ? toolPromptStr + '\n\n' + baseContent : baseContent
+  const fetchNonStream = toolsActive
+  const body = { content, stream: fetchNonStream ? false : stream !== false, ...(!payload.cid ? { aid } : { cid: payload.cid }) }
+  const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(60000) })
+  if (!resp.ok) throw new Error('Arko error ' + resp.status + ': ' + (await resp.text()))
+  if (fetchNonStream) {
+    const json2 = await resp.json()
+    const assistantMsg2 = json2?.data?.messages?.find((m) => m.role === 'assistant')
+    const text2 = assistantMsg2?.content || ''
+    const dataCid2 = json2?.data?.chat?.id
+    const toolCall = tryExtractToolCall(text2)
+    if (toolCall) {
+      if (stream) {
+        const { readable, writable } = new TransformStream()
+        const writer = writable.getWriter()
+        const encoder = new TextEncoder()
+        ;(async () => writeChunks(writer, encoder, [
+          { choices: [{ index: 0, delta: { role: 'assistant', content: null }, finish_reason: null }] },
+          { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: toolCall.id, type: 'function', function: { name: toolCall.function.name, arguments: toolCall.function.arguments } }] }, finish_reason: null }] },
+          { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }
+        ], dataCid2))()
+        return new Response(readable, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' } })
+      }
+      const result3 = { id: cidStr(crypto.randomUUID?.()), object: 'chat.completion', created: now, model, choices: [{ index: 0, message: { role: 'assistant', content: null, tool_calls: [toolCall] }, finish_reason: 'tool_calls' }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } }
+      if (dataCid2) result3._cid = dataCid2
+      return result3
+    }
+    if (stream) {
+      const { readable, writable } = new TransformStream()
+      const writer = writable.getWriter()
+      const encoder = new TextEncoder()
+      ;(async () => writeChunks(writer, encoder, [
+        { choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] },
+        { choices: [{ index: 0, delta: { content: text2 }, finish_reason: null }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }
+      ], dataCid2))()
+      return new Response(readable, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' } })
+    }
+    const result2 = { id: cidStr(crypto.randomUUID?.()), object: 'chat.completion', created: now, model, choices: [{ index: 0, message: { role: 'assistant', content: text2 }, finish_reason: 'stop' }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } }
+    if (dataCid2) result2._cid = dataCid2
+    return result2
+  }
+  if (stream) {
+    const { readable, writable } = new TransformStream()
+    const writer = writable.getWriter()
+    const encoder = new TextEncoder()
+    let cidSent = false, buf = ''
+    resp.body.pipeTo(new WritableStream({
+      async write(chunk) {
+        buf += new TextDecoder().decode(chunk)
+        const lines = buf.split('\n')
+        buf = lines.pop() || ''
+        for (const line of lines) {
+          if (!line.trim()) continue
+          try {
+            const event = JSON.parse(line)
+            if (event.type === 'chat' && event.id && !cidSent) {
+              cidSent = true
+              await writer.write(encoder.encode('data: ' + JSON.stringify({ type: 'cid', cid: event.id }) + '\n\n'))
+            }
+            if (event.type === 'delta' && event.content) {
+              await writer.write(encoder.encode('data: ' + JSON.stringify({ id: cidStr(crypto.randomUUID?.()), object: 'chat.completion.chunk', created: now, model, choices: [{ index: 0, delta: { content: event.content }, finish_reason: null }] }) + '\n\n'))
+            }
+            if (event.type === 'error') {
+              await writer.write(encoder.encode('data: ' + JSON.stringify({ error: { message: event.message || 'Arko stream error', code: event.code } }) + '\n\n'))
+            }
+          } catch {}
+        }
+      },
+      async close() {
+        try { await writer.write(encoder.encode('data: [DONE]\n\n')) } catch {}
+        try { await writer.close() } catch {}
+      },
+      async abort() {
+        try { await writer.close() } catch {}
+      }
+    })).catch(() => {})
+    return new Response(readable, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' } })
+  }
+  const json = await resp.json()
+  const assistantMsg = json?.data?.messages?.find((m) => m.role === 'assistant')
+  const text = assistantMsg?.content || ''
+  const dataCid = json?.data?.chat?.id
+  const result = { id: cidStr(crypto.randomUUID?.()), object: 'chat.completion', created: now, model, choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } }
+  if (dataCid) result._cid = dataCid
+  return result
 }
 
 function formatMessageForCWF(msg) {

@@ -228,6 +228,7 @@ body{background:var(--bs-dark);min-height:100vh}
             <select class="form-select" id="providerType" onchange="onProviderTypeChange()">
               <option value="openai">openai</option>
               <option value="chatwithfiction">chatwithfiction</option>
+              <option value="arko">arko</option>
             </select>
           </div>
           <div class="col-12">

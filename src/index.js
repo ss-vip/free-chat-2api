@@ -166,11 +166,9 @@ app.get('/api/models', async (c) => {
 
 app.post('/api/playground/chat', async (c) => {
   if (!(await requireAuth(c))) return c.json({ error: '未登入' }, 401)
-  const { model, messages, stream, tools, tool_choice } = await c.req.json()
+  const { model, messages, stream, ...rest } = await c.req.json()
   const providers = await getProviders(c.env.DB)
-  const payload = { model, messages, stream: stream !== false }
-  if (tools) payload.tools = tools
-  if (tool_choice) payload.tool_choice = tool_choice
+  const payload = { model, messages, stream: stream !== false, ...rest }
   try {
     const result = await proxyWithFallback(providers, model, 'v1/chat/completions', payload, stream !== false)
     if (stream !== false) return result
@@ -213,6 +211,30 @@ app.post('/v1/chat/completions', async (c) => {
   } catch (e) {
     return c.json({ error: e.message }, 502)
   }
+})
+
+app.post('/api/debug/chat', async (c) => {
+  const body = await c.req.json()
+  const tools = body.tools || body.functions || []
+  const info = {
+    model: body.model,
+    toolsCount: tools.length,
+    tools: tools.map((t, i) => {
+      const def = (typeof t === 'object' && t !== null) ? {
+        hasType: !!t.type,
+        type: t.type,
+        hasFunction: !!t.function,
+        name: t.function?.name || t.name,
+        hasDescription: !!(t.function?.description || t.description),
+        hasParameters: !!(t.function?.parameters || t.parameters),
+        paramCount: Object.keys(t.function?.parameters?.properties || t.parameters?.properties || {}).length
+      } : { raw: String(t).slice(0, 100) }
+      return def
+    }),
+    messagesCount: (body.messages || []).length,
+    lastRole: (body.messages || []).slice(-1)[0]?.role
+  }
+  return c.json({ debug: info, body })
 })
 
 app.all('*', (c) => c.text('Not Found', 404))
