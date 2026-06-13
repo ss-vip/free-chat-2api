@@ -9,6 +9,8 @@ export function dashboardHtml(origin) {
 <style>
 :root{--sidebar-width:220px}
 body{background:var(--bs-dark);min-height:100vh}
+#loadingOverlay{position:fixed;inset:0;z-index:99999;background:var(--bs-dark);display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px}
+#loadingOverlay.hidden{display:none}
 #loginOverlay{position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.85);display:flex;align-items:center;justify-content:center;backdrop-filter:blur(4px)}
 #loginOverlay.hidden{display:none}
 .sidebar{width:var(--sidebar-width);position:fixed;top:56px;left:0;bottom:0;background:var(--bs-dark);border-right:1px solid var(--bs-border-color);overflow-y:auto;z-index:100}
@@ -23,6 +25,8 @@ body{background:var(--bs-dark);min-height:100vh}
 #page-playground.active .col-md-9{display:flex;flex-direction:column}
 #page-playground.active .chat-box{flex:1;min-height:0;overflow-y:auto;height:auto!important}
 #page-playground.active .input-group{flex-shrink:0}
+#page-playground.active .input-group textarea{border-bottom-right-radius:0}
+#page-playground.active .input-group .btn{border-top-left-radius:0;border-bottom-left-radius:0;min-height:calc(1.5em + .75rem + 4px)}
 .table-providers th{background:var(--bs-tertiary-bg);font-size:.85rem;text-transform:uppercase;letter-spacing:.5px}
 .model-badge{font-size:.75rem;margin:2px;display:inline-block}
 .welcome-section{text-align:center;padding:3rem 1rem}
@@ -40,7 +44,12 @@ body{background:var(--bs-dark);min-height:100vh}
 </head>
 <body>
 
-<div id="loginOverlay">
+<div id="loadingOverlay">
+  <div class="spinner-border text-info" style="width:2.5rem;height:2.5rem" role="status"></div>
+  <div class="text-secondary small">載入中...</div>
+</div>
+
+<div id="loginOverlay" class="hidden">
   <div class="card border-0" style="min-width:320px;background:var(--bs-tertiary-bg)">
     <div class="card-body p-4 text-center">
       <h4 class="mb-1">🔐 Dashboard</h4>
@@ -200,7 +209,7 @@ body{background:var(--bs-dark);min-height:100vh}
       </div>
       <div class="chat-box" id="chatBox"></div>
       <div class="input-group">
-        <input type="text" class="form-control" id="userInput" placeholder="輸入訊息..." onkeydown="if(event.key==='Enter')sendPlayground()">
+        <textarea class="form-control" id="userInput" placeholder="輸入訊息... (Ctrl+Enter 發送)" rows="2" style="resize:none" onkeydown="if(event.key==='Enter'&&(event.ctrlKey||event.metaKey)){event.preventDefault();sendPlayground()}"></textarea>
         <button class="btn btn-info" id="playgroundSend" onclick="sendPlayground()">發送</button>
       </div>
     </div>
@@ -227,7 +236,6 @@ body{background:var(--bs-dark);min-height:100vh}
             <label class="form-label">類型</label>
             <select class="form-select" id="providerType" onchange="onProviderTypeChange()">
               <option value="openai">openai</option>
-              <option value="chatwithfiction">chatwithfiction</option>
               <option value="arko">arko</option>
             </select>
           </div>
@@ -242,8 +250,13 @@ body{background:var(--bs-dark);min-height:100vh}
             <div class="form-text text-secondary" id="providerApiKeyHint"></div>
           </div>
           <div class="col-12">
-            <label class="form-label">模型（逗號分隔）</label>
+            <label class="form-label">模型（逗號分隔，路由匹配用）</label>
             <input type="text" class="form-control" id="providerModels" placeholder="gpt-4o, gpt-4o-mini 或 * 代表全部">
+          </div>
+          <div class="col-12">
+            <label class="form-label">上游 Agent ID (arko 專用)</label>
+            <input type="text" class="form-control" id="providerUpstreamModel" placeholder="arko agent UUID (如 550e8400-e29b-41d4-a716-446655440000)">
+            <div class="form-text text-secondary">僅 arko 類型需填；對應 Arko Studio 的 Agent ID</div>
           </div>
           <div class="col-md-6">
             <label class="form-label">優先順序</label>
@@ -296,7 +309,7 @@ async function checkAuth() {
   try {
     const r = await fetch(API_BASE + '/api/auth/status', { credentials: 'include' })
     const d = await r.json()
-    if (d.authed) { onLogin(); return }
+    if (d.authed) { document.getElementById('loadingOverlay').classList.add('hidden'); onLogin(); return }
     if (!d.passwordRequired) {
       const lr = await fetch(API_BASE + '/api/auth/login', {
         method: 'POST', credentials: 'include',
@@ -304,9 +317,10 @@ async function checkAuth() {
         body: JSON.stringify({ password: '' })
       })
       const ld = await lr.json()
-      if (ld.ok) { onLogin(); return }
+      if (ld.ok) { document.getElementById('loadingOverlay').classList.add('hidden'); onLogin(); return }
     }
   } catch {}
+  document.getElementById('loadingOverlay').classList.add('hidden')
   document.getElementById('loginOverlay').classList.remove('hidden')
 }
 
@@ -423,6 +437,9 @@ function getProviderModal() {
 }
 
 function onProviderTypeChange() {
+  const type = document.getElementById('providerType').value
+  const upstreamRow = document.getElementById('providerUpstreamModel').closest('.col-12')
+  upstreamRow.style.display = type === 'arko' ? '' : 'none'
 }
 
 function parseModelsInput(value) {
@@ -438,6 +455,7 @@ function showProviderModal(provider) {
   document.getElementById('providerBaseUrl').value = provider ? (provider.base_url || '') : ''
   document.getElementById('providerApiKey').value = ''
   document.getElementById('providerModels').value = provider ? (() => { try { return JSON.parse(provider.models).join(', ') } catch { return '' } })() : ''
+  document.getElementById('providerUpstreamModel').value = provider ? (provider.upstream_model || '') : ''
   document.getElementById('providerPriority').value = provider ? (provider.priority || 0) : 0
   document.getElementById('providerEnabled').checked = provider ? !!provider.enabled : true
   document.getElementById('providerApiKeyHint').textContent = provider && provider.api_key_set ? '已設定 API Key，留空則保留現有值' : ''
@@ -460,6 +478,7 @@ async function saveProvider() {
   const base_url = document.getElementById('providerBaseUrl').value.trim()
   const api_key = document.getElementById('providerApiKey').value
   const models = parseModelsInput(document.getElementById('providerModels').value)
+  const upstream_model = document.getElementById('providerUpstreamModel').value.trim()
   const priority = parseInt(document.getElementById('providerPriority').value, 10) || 0
   const enabled = document.getElementById('providerEnabled').checked
   const errEl = document.getElementById('providerFormError')
@@ -468,7 +487,7 @@ async function saveProvider() {
   if (!base_url) { errEl.textContent = '請輸入 API 網址'; return }
   errEl.textContent = ''
 
-  const body = { name, type, base_url, models, priority, enabled }
+  const body = { name, type, base_url, models, upstream_model, priority, enabled }
   if (api_key) body.api_key = api_key
 
   try {
@@ -477,7 +496,14 @@ async function saveProvider() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     })
-    const d = await r.json()
+    let d
+    try {
+      d = await r.json()
+    } catch {
+      const text = await r.text()
+      errEl.textContent = '伺服器錯誤 (' + r.status + '): ' + text.slice(0, 200)
+      return
+    }
     if (!r.ok) { errEl.textContent = d.error || '儲存失敗'; return }
     getProviderModal().hide()
     loadProviders()
@@ -552,6 +578,8 @@ async function loadPlayground() {
     seen.add(m.id)
     sel.innerHTML += '<option value="' + esc(m.id) + '">' + esc(m.id) + ' (' + esc(m.provider_name) + ')</option>'
   })
+  // 預設選中 openai 模型（如果存在）
+  sel.value = 'openai'
 }
 
 function clearChat() {
@@ -559,24 +587,37 @@ function clearChat() {
 }
 
 let abortController = null
+let chatCid = ''
+
+function buildConversationHistory() {
+  const msgs = []
+  const systemPrompt = document.getElementById('systemPrompt').value.trim()
+  if (systemPrompt) msgs.push({ role: 'system', content: systemPrompt })
+  const bubbles = document.querySelectorAll('#chatBox .msg')
+  bubbles.forEach(el => {
+    if (el.classList.contains('user')) msgs.push({ role: 'user', content: el.textContent })
+    if (el.classList.contains('assistant') && el.textContent.trim()) msgs.push({ role: 'assistant', content: el.textContent })
+  })
+  return msgs
+}
 
 async function sendPlayground() {
-  const msg = document.getElementById('userInput').value.trim()
+  const input = document.getElementById('userInput')
+  const msg = input.value.trim()
   if (!msg) return
   const model = document.getElementById('playgroundModel').value
   if (!model) { toast('請選擇模型', 'warning'); return }
-  const stream = document.getElementById('streamToggle').checked
   const temp = parseFloat(document.getElementById('temperature').value) || 0.7
   const maxTokens = parseInt(document.getElementById('maxTokens').value) || 2048
-  const systemPrompt = document.getElementById('systemPrompt').value.trim()
   const chatBox = document.getElementById('chatBox')
 
-  const messages = []
-  if (systemPrompt) messages.push({ role: 'system', content: systemPrompt })
+  // 從 DOM 重建完整對話歷史，再加上新的 user 訊息
+  const messages = buildConversationHistory()
   messages.push({ role: 'user', content: msg })
 
   chatBox.innerHTML += '<div class="msg user">' + esc(msg) + '</div>'
-  document.getElementById('userInput').value = ''
+  input.value = ''
+  input.style.height = 'auto'
   chatBox.scrollTop = chatBox.scrollHeight
 
   const sendBtn = document.getElementById('playgroundSend')
@@ -593,47 +634,49 @@ async function sendPlayground() {
   abortController = new AbortController()
 
   try {
-    if (stream) {
-      const r = await fetch(API_BASE + '/api/playground/chat', {
-        method: 'POST', credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model, messages, stream: true, temperature: temp, max_tokens: maxTokens }),
-        signal: abortController.signal
-      })
-      if (!r.ok) { const e = await r.json(); throw new Error(e.error || r.statusText) }
-      const reader = r.body.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ''
-      let fullText = ''
-      msgEl.textContent = ''
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split('\\n')
-        buffer = lines.pop() || ''
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue
-          const data = line.slice(6)
-          if (data === '[DONE]') continue
-          try {
-            const parsed = JSON.parse(data)
-            const content = parsed.choices?.[0]?.delta?.content || parsed.choices?.[0]?.text || ''
-            if (content) { fullText += content; msgEl.textContent = fullText }
-          } catch {}
-        }
-        chatBox.scrollTop = chatBox.scrollHeight
-      }
-    } else {
-      const r = await api('/api/playground/chat', {
-        method: 'POST', credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model, messages, stream: false, temperature: temp, max_tokens: maxTokens })
-      })
-      const d = await r.json()
-      const text = d.choices?.[0]?.message?.content || d.choices?.[0]?.text || JSON.stringify(d)
+    const r = await fetch(API_BASE + '/api/playground/chat', {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, messages, stream: true, temperature: temp, max_tokens: maxTokens, cid: chatCid || undefined }),
+      signal: abortController.signal
+    })
+    if (!r.ok) { const e = await r.json(); throw new Error(e.error || r.statusText) }
+    const contentType = r.headers.get('Content-Type') || ''
+    // 若回應不是 text/event-stream，嘗試 JSON 解析
+    if (!contentType.includes('text/event-stream') && !contentType.includes('text/plain')) {
+      const json = await r.json()
+      const text = json.choices?.[0]?.message?.content || json.choices?.[0]?.text || JSON.stringify(json)
       msgEl.textContent = text
+      sendBtn.disabled = false
+      sendBtn.textContent = '➤ 發送'
+      return
     }
+    const reader = r.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    let fullText = ''
+    msgEl.textContent = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\\n')
+      buffer = lines.pop() || ''
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue
+        const data = line.slice(6)
+        if (data === '[DONE]') continue
+        try {
+          const parsed = JSON.parse(data)
+          const content = parsed.choices?.[0]?.delta?.content || parsed.choices?.[0]?.text || ''
+          if (content) { fullText += content; msgEl.textContent = fullText }
+          if (parsed._cid) chatCid = parsed._cid
+        } catch {}
+      }
+      chatBox.scrollTop = chatBox.scrollHeight
+    }
+    // 若串流完成但無內容，顯示原始回應片段（除錯）
+    if (!fullText) msgEl.textContent = '（無回應內容—請檢查伺服器日誌）'
   } catch (e) {
     if (e.name !== 'AbortError') {
       msgEl.className = 'msg error'
@@ -649,6 +692,12 @@ function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.
 
 document.getElementById('temperature').addEventListener('input', function() {
   document.getElementById('tempVal').textContent = this.value
+})
+
+// textarea 自動增高
+document.getElementById('userInput').addEventListener('input', function() {
+  this.style.height = 'auto'
+  this.style.height = Math.min(this.scrollHeight, 160) + 'px'
 })
 </script>
 </body></html>`

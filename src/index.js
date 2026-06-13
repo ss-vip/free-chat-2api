@@ -14,11 +14,16 @@ import {
 } from './lib/auth.js'
 
 const app = new Hono()
+let dbInitialized = false
 
 app.use('*', async (c, next) => {
   try {
-    if (c.env.DB) await initDB(c.env.DB)
+    if (c.env.DB && !dbInitialized) {
+      await initDB(c.env.DB)
+      dbInitialized = true
+    }
   } catch (e) {
+    dbInitialized = false
     console.error('initDB failed:', e)
     return c.json({ error: 'Database initialization failed' }, 503)
   }
@@ -122,12 +127,17 @@ app.post('/api/providers', async (c) => {
 })
 
 app.put('/api/providers/:id', async (c) => {
-  if (!(await requireAuth(c))) return c.json({ error: '未登入' }, 401)
-  const id = parseInt(c.req.param('id'))
-  const data = await c.req.json()
-  const provider = await updateProvider(c.env.DB, id, data)
-  if (!provider) return c.json({ error: '提供者不存在' }, 404)
-  return c.json(sanitizeProvider(provider))
+  try {
+    if (!(await requireAuth(c))) return c.json({ error: '未登入' }, 401)
+    const id = parseInt(c.req.param('id'))
+    const data = await c.req.json()
+    const provider = await updateProvider(c.env.DB, id, data)
+    if (!provider) return c.json({ error: '提供者不存在' }, 404)
+    return c.json(sanitizeProvider(provider))
+  } catch (e) {
+    console.error('updateProvider error:', e)
+    return c.json({ error: e.message || '更新提供者失敗' }, 500)
+  }
 })
 
 app.delete('/api/providers/:id', async (c) => {
@@ -166,13 +176,12 @@ app.get('/api/models', async (c) => {
 
 app.post('/api/playground/chat', async (c) => {
   if (!(await requireAuth(c))) return c.json({ error: '未登入' }, 401)
-  const { model, messages, stream, ...rest } = await c.req.json()
+  const { model, messages, ...rest } = await c.req.json()
   const providers = await getProviders(c.env.DB)
-  const payload = { model, messages, stream: stream !== false, ...rest }
+  // 永遠用串流避免 timeout
+  const payload = { model, messages, stream: true, ...rest }
   try {
-    const result = await proxyWithFallback(providers, model, 'v1/chat/completions', payload, stream !== false)
-    if (stream !== false) return result
-    return c.json(result)
+    return await proxyWithFallback(providers, model, 'v1/chat/completions', payload, true)
   } catch (e) {
     return c.json({ error: e.message }, 502)
   }
@@ -200,14 +209,12 @@ app.post('/v1/chat/completions', async (c) => {
   const stored = await getClientToken(c.env.DB)
   if (!stored || token !== stored) return c.json({ error: 'Unauthorized' }, 401)
   const body = await c.req.json()
-  const { model, messages, stream, ...rest } = body
+  const { model, messages, ...rest } = body
   const providers = await getProviders(c.env.DB)
-  const doStream = stream !== false
-  const payload = { model, messages, stream: doStream, ...rest }
+  // 永遠用串流避免 timeout
+  const payload = { model, messages, stream: true, ...rest }
   try {
-    const result = await proxyWithFallback(providers, model, 'v1/chat/completions', payload, doStream)
-    if (doStream) return result
-    return c.json(result)
+    return await proxyWithFallback(providers, model, 'v1/chat/completions', payload, true)
   } catch (e) {
     return c.json({ error: e.message }, 502)
   }
@@ -219,7 +226,7 @@ app.post('/api/debug/chat', async (c) => {
   const info = {
     model: body.model,
     toolsCount: tools.length,
-    tools: tools.map((t, i) => {
+    tools: tools.map((t) => {
       const def = (typeof t === 'object' && t !== null) ? {
         hasType: !!t.type,
         type: t.type,
@@ -235,6 +242,11 @@ app.post('/api/debug/chat', async (c) => {
     lastRole: (body.messages || []).slice(-1)[0]?.role
   }
   return c.json({ debug: info, body })
+})
+
+app.onError((err, c) => {
+  console.error('Unhandled error:', err)
+  return c.json({ error: err.message || 'Internal Server Error' }, 500)
 })
 
 app.all('*', (c) => c.text('Not Found', 404))

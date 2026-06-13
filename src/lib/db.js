@@ -52,21 +52,9 @@ export async function initDB(db) {
   }
   if (currentVersion < 2) {
     try { await db.prepare("ALTER TABLE providers ADD COLUMN type TEXT NOT NULL DEFAULT 'openai'").run() } catch {}
-    const count = await db.prepare('SELECT COUNT(*) as cnt FROM providers').first()
-    if (count && count.cnt === 0) {
-      await db.prepare(
-        "INSERT INTO providers (name, base_url, type, models, priority, enabled) VALUES (?, ?, ?, ?, ?, ?)"
-      ).bind('Chat With Fiction', 'https://www.chatwithfiction.com/api/gpt', 'chatwithfiction', '["chatwithfiction-gpt"]', 0, 1).run()
-    }
     await db.prepare('UPDATE schema_meta SET version = 2 WHERE id = 1').run()
   }
   if (currentVersion < 3) {
-    const existing = await db.prepare("SELECT id FROM providers WHERE type = 'chatwithfiction'").first()
-    if (!existing) {
-      await db.prepare(
-        "INSERT INTO providers (name, base_url, type, models, priority, enabled) VALUES (?, ?, ?, ?, ?, ?)"
-      ).bind('Chat With Fiction', 'https://www.chatwithfiction.com/api/gpt', 'chatwithfiction', '["chatwithfiction-gpt"]', 0, 1).run()
-    }
     await db.prepare('UPDATE schema_meta SET version = 3 WHERE id = 1').run()
   }
   if (currentVersion < 7) {
@@ -78,6 +66,14 @@ export async function initDB(db) {
   if (currentVersion < 8) {
     await db.prepare('DELETE FROM sessions WHERE expires_at < datetime(\'now\')').run()
     await db.prepare('UPDATE schema_meta SET version = 8 WHERE id = 1').run()
+  }
+  if (currentVersion < 9) {
+    const { results: cols } = await db.prepare("PRAGMA table_info('providers')").all()
+    const hasColumn = cols?.some(c => c.name === 'upstream_model')
+    if (!hasColumn) {
+      await db.prepare("ALTER TABLE providers ADD COLUMN upstream_model TEXT DEFAULT ''").run()
+    }
+    await db.prepare('UPDATE schema_meta SET version = 9 WHERE id = 1').run()
   }
 }
 
@@ -107,14 +103,26 @@ export async function getConfig(db) {
   return await db.prepare('SELECT * FROM config WHERE id = 1').first()
 }
 
+// 模組層級快取（isolate 生命週期內有效，減少 D1 讀取）
+let _tokenCache = null
+let _providersCache = null
+
+export function invalidateDBCache() {
+  _tokenCache = null
+  _providersCache = null
+}
+
 export async function getClientToken(db) {
+  if (_tokenCache !== null) return _tokenCache
   const row = await db.prepare('SELECT client_token FROM config WHERE id = 1').first()
-  return row ? row.client_token : ''
+  _tokenCache = row ? row.client_token : ''
+  return _tokenCache
 }
 
 export async function rotateClientToken(db) {
   const token = generateToken()
   await db.prepare('UPDATE config SET client_token = ?, updated_at = datetime(\'now\') WHERE id = 1').bind(token).run()
+  _tokenCache = token
   return token
 }
 
@@ -128,8 +136,10 @@ export async function setDashboardPasswordHash(db, hash) {
 }
 
 export async function getProviders(db) {
+  if (_providersCache) return _providersCache
   const { results } = await db.prepare('SELECT * FROM providers ORDER BY priority DESC, id ASC').all()
-  return results || []
+  _providersCache = results || []
+  return _providersCache
 }
 
 export async function getProvider(db, id) {
@@ -137,27 +147,30 @@ export async function getProvider(db, id) {
 }
 
 export async function createProvider(db, data) {
-  const { name, base_url, api_key, type, models, priority, enabled } = data
+  _providersCache = null
+  const { name, base_url, api_key, type, models, upstream_model, priority, enabled } = data
   const modelsJson = JSON.stringify(models || [])
   const { results } = await db.prepare(
-    'INSERT INTO providers (name, base_url, api_key, type, models, priority, enabled) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *'
-  ).bind(name, base_url || '', api_key || '', type || 'openai', modelsJson, priority || 0, enabled !== undefined ? (enabled ? 1 : 0) : 1).all()
+    'INSERT INTO providers (name, base_url, api_key, type, models, upstream_model, priority, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *'
+  ).bind(name, base_url || '', api_key || '', type || 'openai', modelsJson, upstream_model || '', priority || 0, enabled !== undefined ? (enabled ? 1 : 0) : 1).all()
   return results?.[0] || null
 }
 
 export async function updateProvider(db, id, data) {
-  const { name, base_url, api_key, type, models, priority, enabled } = data
+  _providersCache = null
+  const { name, base_url, api_key, type, models, upstream_model, priority, enabled } = data
   const existing = await db.prepare('SELECT * FROM providers WHERE id = ?').bind(id).first()
   if (!existing) return null
   const modelsJson = models ? JSON.stringify(models) : existing.models
   await db.prepare(
-    'UPDATE providers SET name=?, base_url=?, api_key=?, type=?, models=?, priority=?, enabled=?, updated_at=datetime(\'now\') WHERE id=?'
+    'UPDATE providers SET name=?, base_url=?, api_key=?, type=?, models=?, upstream_model=?, priority=?, enabled=?, updated_at=datetime(\'now\') WHERE id=?'
   ).bind(
     name ?? existing.name,
     base_url ?? existing.base_url,
     api_key !== undefined ? api_key : existing.api_key,
     type ?? existing.type,
     modelsJson,
+    upstream_model !== undefined ? upstream_model : existing.upstream_model,
     priority !== undefined ? priority : existing.priority,
     enabled !== undefined ? (enabled ? 1 : 0) : existing.enabled,
     id
@@ -166,6 +179,7 @@ export async function updateProvider(db, id, data) {
 }
 
 export async function deleteProvider(db, id) {
+  _providersCache = null
   await db.prepare('DELETE FROM providers WHERE id = ?').bind(id).run()
 }
 

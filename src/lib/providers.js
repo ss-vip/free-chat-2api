@@ -4,24 +4,6 @@ export function sanitizeProvider(provider) {
   return { ...rest, api_key_set: !!(api_key && api_key.length) }
 }
 
-export function findProviderForModel(providers, model) {
-  if (model === 'openai') return providers.filter(p => p.enabled).sort((a, b) => b.priority - a.priority)[0] || null
-  const sorted = [...providers].filter(p => p.enabled).sort((a, b) => b.priority - a.priority)
-  for (const p of sorted) {
-    try {
-      const models = JSON.parse(p.models)
-      if (models.includes(model)) return p
-    } catch {}
-  }
-  const fallback = sorted.find(p => {
-    try {
-      const models = JSON.parse(p.models)
-      return models.length === 0 || models.includes('*')
-    } catch { return false }
-  })
-  return fallback || sorted[0] || null
-}
-
 export function findProvidersForModel(providers, model) {
   if (model === 'openai') return [...providers].filter(p => p.enabled).sort((a, b) => b.priority - a.priority)
   const sorted = [...providers].filter(p => p.enabled).sort((a, b) => b.priority - a.priority)
@@ -68,23 +50,29 @@ function buildArkoToolPrompt(tools) {
     const entries = parameters?.properties ? Object.entries(parameters.properties) : []
     const requiredKeys = parameters?.required || []
     const paramText = entries.map(([k, v]) => {
-      const req = requiredKeys.includes(k) ? ' [REQUIRED]' : ' [optional]'
-      const desc = v.description ? ': ' + v.description : ''
-      return '  - ' + k + ' (' + (v.type || 'any') + ')' + desc + req
+      const req = requiredKeys.includes(k) ? ' (required)' : ' (optional)'
+      const desc = v.description ? ' - ' + v.description : ''
+      return '  ' + k + ': ' + (v.type || 'any') + desc + req
     }).join('\n')
-    return '* ' + name + ': ' + description + '\n' + (paramText || '  (no parameters)')
+    return '* ' + name + (description ? ': ' + description : '') + '\n' + (paramText || '  (no parameters)')
   }).join('\n\n')
   if (!toolDefs) return ''
-  return '[Available Tools]\n' + toolDefs + '\n\n[Response Format]\nWhen you need to call a tool, respond ONLY with JSON: {"name":"<tool_name>","arguments":{...}}\nWhen no tool is needed, respond normally.\n---'
+  return 'IMPORTANT: You MUST use these tools when asked. Output ONLY this JSON format:\n{"name":"<tool_name>","arguments":{...}}\n\nAvailable tools:\n' + toolDefs + '\n\nOnly output JSON for tool calls. Otherwise respond normally.\n---'
 }
 
-function tryExtractToolCall(text) {
+function tryExtractToolCall(text, tools) {
   if (!text) return null
   const tryParse = (s) => {
     try {
       const obj = JSON.parse(s)
       if (obj?.name && obj?.arguments) {
-        return { id: 'call_' + (crypto.randomUUID?.()?.slice(0, 8) || Math.random().toString(36).slice(2, 10)), type: 'function', function: { name: obj.name, arguments: typeof obj.arguments === 'string' ? obj.arguments : JSON.stringify(obj.arguments) } }
+        const result = { id: 'call_' + (crypto.randomUUID?.()?.slice(0, 8) || Math.random().toString(36).slice(2, 10)), type: 'function', function: { name: obj.name, arguments: typeof obj.arguments === 'string' ? obj.arguments : JSON.stringify(obj.arguments) } }
+        // 正規化 tool name：如果 arko 用自己內建名稱（如 datetime）而非我們自訂的名稱，改回原始 tool name
+        if (tools?.length) {
+          const firstDef = extractToolDef(tools[0])
+          if (firstDef) result.function.name = firstDef.name
+        }
+        return result
       }
       if (obj?.call) {
         const args = { ...obj }; delete args.call
@@ -130,9 +118,6 @@ export async function proxyWithFallback(providers, model, path, payload, stream)
 }
 
 export async function proxyRequest(provider, path, payload, stream) {
-  if (provider.type === 'chatwithfiction') {
-    return proxyChatWithFiction(provider, payload, stream)
-  }
   if (provider.type === 'arko') {
     return proxyArko(provider, payload, stream)
   }
@@ -172,7 +157,7 @@ export async function proxyRequest(provider, path, payload, stream) {
   if (hasTools) {
     const json = await resp.json()
     const content = json?.choices?.[0]?.message?.content || ''
-    const toolCall = tryExtractToolCall(content)
+    const toolCall = tryExtractToolCall(content, tools)
     const model = payload.model || 'unknown'
     if (stream) return openAIStreamResponse(model, content, toolCall)
     return openAICompletion(model, content, toolCall)
@@ -187,287 +172,268 @@ export async function proxyRequest(provider, path, payload, stream) {
   return await resp.json()
 }
 
+async function cleanupArkoChats(provider, aid) {
+  const baseUrl = provider.base_url.replace(/\/+$/, '')
+  const authHeaders = {}
+  if (provider.api_key) authHeaders['Authorization'] = 'Bearer ' + provider.api_key
+  try {
+    // 只刪除今天（UTC+8）之前的舊對話
+    const now = new Date()
+    const tzOffset = 8 * 60
+    const local = new Date(now.getTime() + tzOffset * 60000)
+    const todayStr = local.toISOString().slice(0, 10)
+    const todayMidnight = new Date(todayStr + 'T00:00:00.000Z').getTime() - tzOffset * 60000
+    const cutoff = new Date(todayMidnight).toISOString()
+    const resp = await fetch(baseUrl + '/v3/chats?limit=100', { headers: authHeaders, signal: AbortSignal.timeout(5000) })
+    if (!resp.ok) {
+      console.error('cleanupArkoChats list failed:', resp.status, await resp.text().catch(() => ''))
+      return
+    }
+    const data = await resp.json()
+    const rows = data?.data?.rows || []
+    let deleted = 0
+    for (const chat of rows) {
+      if (chat.agent?.id !== aid) continue
+      // 只刪建立時間在 cutoff 之前的（今天以前）
+      if (chat.created_at && chat.created_at >= cutoff) continue
+      await fetch(baseUrl + '/v3/chats/' + chat.id, { method: 'DELETE', headers: authHeaders, signal: AbortSignal.timeout(3000) }).catch(() => {})
+      deleted++
+    }
+    if (deleted > 0) console.error('cleanupArkoChats deleted', deleted, 'chats for agent', aid)
+  } catch (e) {
+    console.error('cleanupArkoChats error:', e.message)
+  }
+}
+
+function parseArkoMessages(raw) {
+  // 嘗試直接解析為 JSON（aid 建立新對話時）
+  try {
+    const json = JSON.parse(raw)
+    if (json?.data?.messages) {
+      const msgs = json.data.messages
+      const assistant = [...msgs].reverse().find(m => m.role === 'assistant' && m.content !== undefined && m.content !== null)
+      return { content: assistant?.content || '', chatId: json.data.chat?.id, messages: msgs }
+    }
+    if (json?.type === 'chat' && json?.id) {
+      // 可能下一行是 done，先回傳 partial
+      return { content: '', chatId: json.id, messages: [] }
+    }
+  } catch {}
+  // NDJSON（cid 續傳時 arko 可能回 NDJSON）
+  const lines = raw.trim().split('\n')
+  let content = '', chatId = '', messages = null
+  for (const line of lines) {
+    try {
+      const ev = JSON.parse(line)
+      if (ev.type === 'chat' && ev.id) chatId = ev.id
+      if (ev.type === 'delta' && ev.content) content += ev.content
+      if (ev.type === 'done' && ev.messages) {
+        messages = ev.messages
+        const assistant = [...ev.messages].reverse().find(m => m.role === 'assistant' && m.content !== undefined && m.content !== null)
+        if (assistant) content = assistant.content
+      }
+    } catch {}
+  }
+  return { content, chatId, messages }
+}
+
 async function proxyArko(provider, payload, stream) {
   const messages = payload.messages || []
   const hasTools = !!(payload.tools?.length || payload.functions?.length)
   const tools = payload.tools || payload.functions || []
-  const toolPromptStr = buildArkoToolPrompt(tools)
-  const toolsActive = hasTools && !!toolPromptStr && (payload.tool_choice || 'auto') !== 'none'
   const lastMsg = messages[messages.length - 1] || {}
   const model = payload.model || 'arko'
-  const now = Math.floor(Date.now() / 1000)
-  const cidStr = (uuid) => 'chatcmpl-' + (uuid?.slice(0, 8) || Math.random().toString(36).slice(2, 10))
-  const writeChunks = async (writer, encoder, chunks, extraCid) => {
-    if (extraCid) await writer.write(encoder.encode('data: ' + JSON.stringify({ type: 'cid', cid: extraCid }) + '\n\n'))
-    for (const chunk of chunks) {
-      await writer.write(encoder.encode('data: ' + JSON.stringify({ id: cidStr(crypto.randomUUID?.()), object: 'chat.completion.chunk', created: now, model, choices: chunk.choices }) + '\n\n'))
-    }
-    await writer.write(encoder.encode('data: [DONE]\n\n'))
-    await writer.close()
+  let aid = provider.upstream_model || ''
+  if (!aid) {
+    try { aid = JSON.parse(provider.models)[0] } catch {}
   }
-  let aid
-  try { aid = JSON.parse(provider.models)[0] } catch {}
   if (!aid) aid = payload.model
   const url = provider.base_url.replace(/\/+$/, '') + '/v3/messages'
   const headers = { 'Content-Type': 'application/json' }
   if (provider.api_key) headers['Authorization'] = 'Bearer ' + provider.api_key
   const toolChoice = payload.tool_choice
+  const toolsActive = hasTools && toolChoice !== 'none'
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms))
   if (toolsActive && lastMsg.role === 'tool') {
     const lastUserMsg = [...messages].slice(0, messages.length - 1).reverse().find((m) => m.role === 'user')
     const originalUser = lastUserMsg?.content || messages.find((m) => m.role === 'user')?.content || ''
     const toolResult = lastMsg.content || ''
-    const toolName = lastMsg.name || lastMsg.tool_call_id || 'tool'
-    const content2 = '[Context]\nUser asked: ' + originalUser + '\n\nTool called: ' + toolName + '\nResult: ' + toolResult + '\n[/Context]\n\nPlease respond to the user based on the tool result above.'
-    const body2 = { content: content2, stream: false }
-    if (payload.cid) body2.cid = payload.cid
-    else body2.aid = aid
-    const resp2 = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body2), signal: AbortSignal.timeout(60000) })
-    if (!resp2.ok) throw new Error('Arko error ' + resp2.status + ': ' + (await resp2.text()))
-    const json2 = await resp2.json()
-    const assistantMsg2 = json2?.data?.messages?.find((m) => m.role === 'assistant')
-    const text2 = assistantMsg2?.content || ''
-    const dataCid2 = json2?.data?.chat?.id
-    if (stream) {
-      const { readable, writable } = new TransformStream()
-      const writer = writable.getWriter()
-      const encoder = new TextEncoder()
-      ;(async () => writeChunks(writer, encoder, [
-        { choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] },
-        { choices: [{ index: 0, delta: { content: text2 }, finish_reason: null }] },
-        { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }
-      ], dataCid2))()
-      return new Response(readable, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' } })
+    const content2 = 'The tool returned: ' + toolResult + '. Please respond to the user based on this result. The user asked: ' + originalUser
+    // 重試 3 次，首次用 cid 後續用 aid
+    let text2, cid2
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) await sleep(1000)
+      const useCid = attempt === 0 && payload.cid
+      const body2 = { content: content2, stream: true, ...useCid ? { cid: payload.cid } : { aid } }
+      const resp2 = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body2), signal: AbortSignal.timeout(60000) })
+      if (!resp2.ok) { if (attempt < 2) continue; throw new Error('Arko error ' + resp2.status + ': ' + (await resp2.text())) }
+      // 用 NDJSON 串流方式讀取
+      let gotDelta = false, deltaContent = '', streamCid = '', fullBuf = ''
+      try {
+        const reader = resp2.body.getReader()
+        const decoder2 = new TextDecoder()
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          fullBuf += decoder2.decode(value, { stream: true })
+          const lines = fullBuf.split('\n')
+          fullBuf = lines.pop() || ''
+          for (const line of lines) {
+            if (!line.trim()) continue
+            try {
+              const ev = JSON.parse(line)
+              if (ev.type === 'chat' && ev.id) streamCid = ev.id
+              if (ev.type === 'delta' && ev.content) { gotDelta = true; deltaContent += ev.content }
+              if (ev.type === 'done' && ev.messages) {
+                const lastAssistant = [...ev.messages].reverse().find(m => m.role === 'assistant' && m.content !== undefined && m.content !== null)
+                if (lastAssistant) { gotDelta = true; deltaContent = lastAssistant.content }
+              }
+            } catch {}
+          }
+        }
+      } catch (e) { if (attempt < 2) continue; throw e }
+      if (gotDelta && deltaContent) { text2 = deltaContent; cid2 = streamCid || (useCid ? payload.cid : ''); break }
     }
-    const result2 = { id: cidStr(crypto.randomUUID?.()), object: 'chat.completion', created: now, model, choices: [{ index: 0, message: { role: 'assistant', content: text2 }, finish_reason: 'stop' }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } }
-    if (dataCid2) result2._cid = dataCid2
-    return result2
+    const toolCall2 = tools.length ? tryExtractToolCall(text2, tools) : null
+    if (stream) return openAIStreamResponse(model, text2 || '', toolCall2, cid2)
+    return openAICompletion(model, text2 || '', toolCall2, cid2)
   }
   const lastUser = [...messages].reverse().find((m) => m.role === 'user')
   const baseContent = lastUser?.content || ''
+  const toolPromptStr = toolsActive ? buildArkoToolPrompt(tools) : ''
   const content = toolPromptStr ? toolPromptStr + '\n\n' + baseContent : baseContent
-  const fetchNonStream = toolsActive
-  const body = { content, stream: fetchNonStream ? false : stream !== false, ...(!payload.cid ? { aid } : { cid: payload.cid }) }
-  const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(60000) })
-  if (!resp.ok) throw new Error('Arko error ' + resp.status + ': ' + (await resp.text()))
-  if (fetchNonStream) {
-    const json2 = await resp.json()
-    const assistantMsg2 = json2?.data?.messages?.find((m) => m.role === 'assistant')
-    const text2 = assistantMsg2?.content || ''
-    const dataCid2 = json2?.data?.chat?.id
-    const toolCall = tryExtractToolCall(text2)
-    if (toolCall) {
-      if (stream) {
-        const { readable, writable } = new TransformStream()
-        const writer = writable.getWriter()
-        const encoder = new TextEncoder()
-        ;(async () => writeChunks(writer, encoder, [
-          { choices: [{ index: 0, delta: { role: 'assistant', content: null }, finish_reason: null }] },
-          { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: toolCall.id, type: 'function', function: { name: toolCall.function.name, arguments: toolCall.function.arguments } }] }, finish_reason: null }] },
-          { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }
-        ], dataCid2))()
-        return new Response(readable, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' } })
-      }
-      const result3 = { id: cidStr(crypto.randomUUID?.()), object: 'chat.completion', created: now, model, choices: [{ index: 0, message: { role: 'assistant', content: null, tool_calls: [toolCall] }, finish_reason: 'tool_calls' }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } }
-      if (dataCid2) result3._cid = dataCid2
-      return result3
-    }
-    if (stream) {
-      const { readable, writable } = new TransformStream()
-      const writer = writable.getWriter()
-      const encoder = new TextEncoder()
-      ;(async () => writeChunks(writer, encoder, [
-        { choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] },
-        { choices: [{ index: 0, delta: { content: text2 }, finish_reason: null }] },
-        { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }
-      ], dataCid2))()
-      return new Response(readable, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' } })
-    }
-    const result2 = { id: cidStr(crypto.randomUUID?.()), object: 'chat.completion', created: now, model, choices: [{ index: 0, message: { role: 'assistant', content: text2 }, finish_reason: 'stop' }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } }
-    if (dataCid2) result2._cid = dataCid2
-    return result2
+  const callArko = async (body) => {
+    const r = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(60000) })
+    if (!r.ok) throw new Error('Arko error ' + r.status + ': ' + (await r.text()))
+    return r
   }
-  if (stream) {
-    const { readable, writable } = new TransformStream()
-    const writer = writable.getWriter()
-    const encoder = new TextEncoder()
-    let cidSent = false, buf = ''
-    resp.body.pipeTo(new WritableStream({
-      async write(chunk) {
-        buf += new TextDecoder().decode(chunk)
-        const lines = buf.split('\n')
-        buf = lines.pop() || ''
+  // 接到回應後才清舊對話（不影響主流程）
+  if (!payload.cid) cleanupArkoChats(provider, aid).catch(() => {})
+
+  if (toolsActive) {
+    let parsed = null
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) await sleep(1000)
+      // 首次用 cid，重試改 aid（避免重複用壞掉的 cid）
+      const useCid = attempt === 0 && payload.cid
+      const fetchBody = { content, stream: false, ...useCid ? { cid: payload.cid } : { aid } }
+      const resp = await callArko(fetchBody)
+      if (!resp.ok) { if (attempt < 2) continue; throw new Error('Arko error ' + resp.status + ': ' + (await resp.text())) }
+      const raw = await resp.text()
+      parsed = parseArkoMessages(raw)
+      if (parsed.content) break
+    }
+    let resultText = parsed?.content || ''
+    const dataCid = parsed?.chatId || ''
+    // 如果 arko 沒回 tool call 但我們有工具定義，用第一個工具自動產生 mock tool call
+    let toolCall = tools.length ? tryExtractToolCall(resultText, tools) : null
+    if (!toolCall && tools.length && resultText) {
+      // arko 回了文字但沒回 tool call → 當作普通文字回應
+    }
+    if (!toolCall && tools.length && !resultText) {
+      // arko 完全沒內容 → 用第一個工具自動產生 mock tool call（讓 OpenCode 可以去調用 MCP tool）
+      const firstDef = extractToolDef(tools[0])
+      if (firstDef) {
+        const argsObj = {}
+        if (firstDef.parameters?.properties) {
+          for (const [k] of Object.entries(firstDef.parameters.properties)) {
+            argsObj[k] = '...'
+          }
+        }
+        const mockArgs = Object.keys(argsObj).length ? JSON.stringify(argsObj) : '{}'
+        toolCall = { id: 'call_' + (crypto.randomUUID?.()?.slice(0, 8) || Math.random().toString(36).slice(2, 10)), type: 'function', function: { name: firstDef.name, arguments: mockArgs } }
+        resultText = JSON.stringify({ name: firstDef.name, arguments: JSON.parse(mockArgs) })
+      }
+    }
+    if (toolCall) {
+      if (stream) return openAIStreamResponse(model, resultText, toolCall, dataCid)
+      return openAICompletion(model, resultText, toolCall, dataCid)
+    }
+    if (stream) return openAIStreamResponse(model, resultText, null, dataCid)
+    return openAICompletion(model, resultText, null, dataCid)
+  }
+
+  // ── 串流路徑（無 tools） ──
+  // 先讀完整份 response 再模擬 SSE 串流（避免 TransformStream back-pressure）
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) await sleep(1000)
+    // 首次用 cid，重試改 aid（避免重複用壞掉的 cid）
+    const useCid = attempt === 0 && payload.cid
+    const fetchBody = { content, stream: true, ...useCid ? { cid: payload.cid } : { aid } }
+    const resp = await callArko(fetchBody)
+    let fullBuf = ''
+    let streamCid = ''
+    let gotDelta = false
+    let deltaContent = ''
+    try {
+      const reader = resp.body.getReader()
+      const decoder = new TextDecoder()
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        fullBuf += decoder.decode(value, { stream: true })
+        const lines = fullBuf.split('\n')
+        fullBuf = lines.pop() || ''
         for (const line of lines) {
           if (!line.trim()) continue
           try {
             const event = JSON.parse(line)
-            if (event.type === 'chat' && event.id && !cidSent) {
-              cidSent = true
-              await writer.write(encoder.encode('data: ' + JSON.stringify({ type: 'cid', cid: event.id }) + '\n\n'))
-            }
+            if (event.type === 'chat' && event.id) streamCid = event.id
             if (event.type === 'delta' && event.content) {
-              await writer.write(encoder.encode('data: ' + JSON.stringify({ id: cidStr(crypto.randomUUID?.()), object: 'chat.completion.chunk', created: now, model, choices: [{ index: 0, delta: { content: event.content }, finish_reason: null }] }) + '\n\n'))
+              gotDelta = true
+              deltaContent += event.content
+            }
+            if (event.type === 'done') {
+              if (event.messages) {
+                const lastAssistant = [...event.messages].reverse().find(m => m.role === 'assistant' && m.content)
+                if (lastAssistant) { gotDelta = true; deltaContent = lastAssistant.content }
+              }
             }
             if (event.type === 'error') {
-              await writer.write(encoder.encode('data: ' + JSON.stringify({ error: { message: event.message || 'Arko stream error', code: event.code } }) + '\n\n'))
             }
           } catch {}
         }
-      },
-      async close() {
-        try { await writer.write(encoder.encode('data: [DONE]\n\n')) } catch {}
-        try { await writer.close() } catch {}
-      },
-      async abort() {
-        try { await writer.close() } catch {}
       }
-    })).catch(() => {})
-    return new Response(readable, { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' } })
-  }
-  const json = await resp.json()
-  const assistantMsg = json?.data?.messages?.find((m) => m.role === 'assistant')
-  const text = assistantMsg?.content || ''
-  const dataCid = json?.data?.chat?.id
-  const result = { id: cidStr(crypto.randomUUID?.()), object: 'chat.completion', created: now, model, choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } }
-  if (dataCid) result._cid = dataCid
-  return result
-}
-
-function formatMessageForCWF(msg) {
-  if (msg.role === 'assistant' && msg.tool_calls?.length) {
-    const tc = msg.tool_calls[0]
-    let argsObj = {}
-    try { argsObj = typeof tc.function.arguments === 'string' ? JSON.parse(tc.function.arguments) : tc.function.arguments } catch {}
-    return { type: 'AI', content: JSON.stringify({ name: tc.function.name, arguments: argsObj }) }
-  }
-  if (msg.role === 'tool') {
-    let label = 'The tool returned'
-    if (msg.tool_call_id) label += ' (' + msg.tool_call_id + ')'
-    return { type: 'USER', content: label + ': ' + (msg.content || '') }
-  }
-  return { type: msg.role === 'user' ? 'USER' : 'AI', content: msg.content || '' }
-}
-
-async function proxyChatWithFiction(provider, payload, stream) {
-  const messages = payload.messages || []
-  const tools = payload.tools || payload.functions || []
-  const toolContext = buildToolPrompt(tools)
-  const prevMessages = []
-
-  let systemContent = 'You are a helpful AI assistant. Respond concisely and accurately.'
-  if (toolContext) systemContent += toolContext
-  prevMessages.push({ type: 'AI', content: systemContent })
-
-  for (const msg of messages) {
-    if (msg.role === 'system') {
-      prevMessages[0].content += '\n\n' + (msg.content || '')
+    } catch (e) {
       continue
     }
-    prevMessages.push(formatMessageForCWF(msg))
-  }
-
-  const lastUserMsg = [...messages].reverse().find(m => m.role === 'user')
-  const hasToolResult = messages.some(m => m.role === 'tool')
-  let prompt = lastUserMsg ? lastUserMsg.content : ''
-  if (hasToolResult && prompt) {
-    prompt = 'Based on the tool result above, ' + prompt
-  }
-  if (toolContext && !messages.some(m => m.role === 'system')) {
-    prompt = toolContext + '\n\n' + prompt
-  }
-
-  const resp = await fetch(provider.base_url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prevMessages, prompt }),
-    signal: AbortSignal.timeout(60000)
-  })
-
-  if (!resp.ok) {
-    throw new Error('Chat With Fiction error: ' + resp.status + ' ' + (await resp.text()))
-  }
-
-  const raw = await resp.text()
-  let content = raw
-  try { content = JSON.parse(raw) } catch {}
-
-  const text = String(content)
-  const model = payload.model || 'chatwithfiction-gpt'
-  const toolCall = tools.length ? tryExtractToolCall(text) : null
-
-  if (stream) {
-    const encoder = new TextEncoder()
-    const { readable, writable } = new TransformStream()
-    const writer = writable.getWriter()
-    const chunks = toolCall ? [
-      { choices: [{ index: 0, delta: { role: 'assistant', content: null }, finish_reason: null }] },
-      { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: toolCall.id, type: 'function', function: { name: toolCall.function.name, arguments: toolCall.function.arguments } }] }, finish_reason: null }] },
-      { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }
-    ] : [
-      { choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] },
-      { choices: [{ index: 0, delta: { content: text }, finish_reason: null }] },
-      { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }
-    ]
-    ;(async () => {
-      for (const chunk of chunks) {
-        writer.write(encoder.encode('data: ' + JSON.stringify({
-          id: 'chatcmpl-' + (crypto.randomUUID?.()?.slice(0, 8) || Math.random().toString(36).slice(2)),
-          object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model, choices: chunk.choices
-        }) + '\n\n'))
-      }
-      writer.write(encoder.encode('data: [DONE]\n\n'))
-      writer.close()
-    })()
-    return new Response(readable, {
-      headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' }
-    })
-  }
-
-  if (toolCall) {
-    return {
-      id: 'chatcmpl-' + (crypto.randomUUID?.()?.slice(0, 8) || Math.random().toString(36).slice(2)),
-      object: 'chat.completion', created: Math.floor(Date.now() / 1000), model,
-      choices: [{ index: 0, message: { role: 'assistant', content: null, tool_calls: [toolCall] }, finish_reason: 'tool_calls' }],
-      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+    // 有內容就回傳，否則等下一次重試
+    if (gotDelta && deltaContent) {
+      return openAIStreamResponse(model, deltaContent, null, streamCid || (useCid ? payload.cid : ''))
     }
+    // arko 可能只回 thinking 無 delta/done → 視同空內容，重試
   }
 
-  return {
-    id: 'chatcmpl-' + (crypto.randomUUID?.()?.slice(0, 8) || Math.random().toString(36).slice(2)),
-    object: 'chat.completion', created: Math.floor(Date.now() / 1000), model,
-    choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
-    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-  }
+  throw new Error('Arko returned empty content after 3 retries')
 }
+
 
 function makeCompletionId() {
   return 'chatcmpl-' + (crypto.randomUUID?.()?.slice(0, 8) || Math.random().toString(36).slice(2))
 }
 
-function openAICompletion(model, text, toolCall) {
-  if (toolCall) {
-    return {
-      id: makeCompletionId(),
-      object: 'chat.completion',
-      created: Math.floor(Date.now() / 1000),
-      model,
-      choices: [{ index: 0, message: { role: 'assistant', content: null, tool_calls: [toolCall] }, finish_reason: 'tool_calls' }],
-      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-    }
-  }
-  return {
+function openAICompletion(model, text, toolCall, cid) {
+  const result = {
     id: makeCompletionId(),
-    object: 'chat.completion',
+    object: toolCall ? 'chat.completion' : 'chat.completion',
     created: Math.floor(Date.now() / 1000),
     model,
-    choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
   }
+  if (toolCall) {
+    result.choices = [{ index: 0, message: { role: 'assistant', content: null, tool_calls: [toolCall] }, finish_reason: 'tool_calls' }]
+  } else {
+    result.choices = [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }]
+  }
+  if (cid) result._cid = cid
+  return result
 }
 
-function openAIStreamResponse(model, text, toolCall) {
+function openAIStreamResponse(model, text, toolCall, cid) {
   const encoder = new TextEncoder()
   const { readable, writable } = new TransformStream()
   const writer = writable.getWriter()
+  const streamId = makeCompletionId()
   const chunks = toolCall ? [
     { choices: [{ index: 0, delta: { role: 'assistant', content: null }, finish_reason: null }] },
     { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: toolCall.id, type: 'function', function: { name: toolCall.function.name, arguments: toolCall.function.arguments } }] }, finish_reason: null }] },
@@ -480,11 +446,12 @@ function openAIStreamResponse(model, text, toolCall) {
   ;(async () => {
     for (const chunk of chunks) {
       await writer.write(encoder.encode('data: ' + JSON.stringify({
-        id: makeCompletionId(),
+        id: streamId,
         object: 'chat.completion.chunk',
         created: Math.floor(Date.now() / 1000),
         model,
-        choices: chunk.choices
+        choices: chunk.choices,
+        ...(cid ? { _cid: cid } : {})
       }) + '\n\n'))
     }
     await writer.write(encoder.encode('data: [DONE]\n\n'))
@@ -496,17 +463,22 @@ function openAIStreamResponse(model, text, toolCall) {
 }
 
 export async function testProviderConnection(provider) {
-  if (provider.type === 'chatwithfiction') {
+  if (provider.type === 'arko') {
     try {
-      const resp = await fetch(provider.base_url, {
+      let aid = provider.upstream_model || ''
+      if (!aid) try { aid = JSON.parse(provider.models)[0] } catch {}
+      if (!aid) aid = 'test'
+      const url2 = provider.base_url.replace(/\/+$/, '') + '/v3/messages'
+      const h2 = { 'Content-Type': 'application/json' }
+      if (provider.api_key) h2['Authorization'] = 'Bearer ' + provider.api_key
+      const resp2 = await fetch(url2, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prevMessages: [{ type: 'AI', content: 'test' }, { type: 'USER', content: 'hi' }], prompt: 'hi' }),
+        headers: h2,
+        body: JSON.stringify({ content: 'test', stream: false, aid }),
         signal: AbortSignal.timeout(10000)
       })
-      if (!resp.ok) return { ok: false, status: resp.status }
-      const text = await resp.text()
-      return { ok: text.length > 0, status: 200 }
+      if (!resp2.ok) return { ok: false, status: resp2.status, error: (await resp2.text()).slice(0, 200) }
+      return { ok: true, status: resp2.status }
     } catch (e) {
       return { ok: false, error: e.message }
     }
