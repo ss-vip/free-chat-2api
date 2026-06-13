@@ -255,48 +255,11 @@ async function proxyArko(provider, payload, stream) {
   const toolsActive = hasTools && toolChoice !== 'none'
   const sleep = (ms) => new Promise(r => setTimeout(r, ms))
   if (toolsActive && lastMsg.role === 'tool') {
-    const lastUserMsg = [...messages].slice(0, messages.length - 1).reverse().find((m) => m.role === 'user')
-    const originalUser = lastUserMsg?.content || messages.find((m) => m.role === 'user')?.content || ''
+    // arko 無法直接處理 tool result，改為直接回傳 tool result 文字
+    // OpenCode 收到後會在下一輪帶入完整歷史，由 arko 自然應對
     const toolResult = lastMsg.content || ''
-    const content2 = 'The tool returned: ' + toolResult + '. Please respond to the user based on this result. The user asked: ' + originalUser
-    // 重試 3 次，首次用 cid 後續用 aid
-    let text2, cid2
-    for (let attempt = 0; attempt < 3; attempt++) {
-      if (attempt > 0) await sleep(1000)
-      const useCid = attempt === 0 && payload.cid
-      const body2 = { content: content2, stream: true, ...useCid ? { cid: payload.cid } : { aid } }
-      const resp2 = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body2), signal: AbortSignal.timeout(60000) })
-      if (!resp2.ok) { if (attempt < 2) continue; throw new Error('Arko error ' + resp2.status + ': ' + (await resp2.text())) }
-      // 用 NDJSON 串流方式讀取
-      let gotDelta = false, deltaContent = '', streamCid = '', fullBuf = ''
-      try {
-        const reader = resp2.body.getReader()
-        const decoder2 = new TextDecoder()
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-          fullBuf += decoder2.decode(value, { stream: true })
-          const lines = fullBuf.split('\n')
-          fullBuf = lines.pop() || ''
-          for (const line of lines) {
-            if (!line.trim()) continue
-            try {
-              const ev = JSON.parse(line)
-              if (ev.type === 'chat' && ev.id) streamCid = ev.id
-              if (ev.type === 'delta' && ev.content) { gotDelta = true; deltaContent += ev.content }
-              if (ev.type === 'done' && ev.messages) {
-                const lastAssistant = [...ev.messages].reverse().find(m => m.role === 'assistant' && m.content !== undefined && m.content !== null)
-                if (lastAssistant) { gotDelta = true; deltaContent = lastAssistant.content }
-              }
-            } catch {}
-          }
-        }
-      } catch (e) { if (attempt < 2) continue; throw e }
-      if (gotDelta && deltaContent) { text2 = deltaContent; cid2 = streamCid || (useCid ? payload.cid : ''); break }
-    }
-    const toolCall2 = tools.length ? tryExtractToolCall(text2, tools) : null
-    if (stream) return openAIStreamResponse(model, text2 || '', toolCall2, cid2)
-    return openAICompletion(model, text2 || '', toolCall2, cid2)
+    if (stream) return openAIStreamResponse(model, toolResult, null, payload.cid)
+    return openAICompletion(model, toolResult, null, payload.cid)
   }
   const lastUser = [...messages].reverse().find((m) => m.role === 'user')
   const baseContent = lastUser?.content || ''
@@ -325,13 +288,10 @@ async function proxyArko(provider, payload, stream) {
     }
     let resultText = parsed?.content || ''
     const dataCid = parsed?.chatId || ''
-    // 如果 arko 沒回 tool call 但我們有工具定義，用第一個工具自動產生 mock tool call
+    // arko 可能不支援自訂 tool name，若沒回 tool call 則自動產生 mock tool call
     let toolCall = tools.length ? tryExtractToolCall(resultText, tools) : null
-    if (!toolCall && tools.length && resultText) {
-      // arko 回了文字但沒回 tool call → 當作普通文字回應
-    }
-    if (!toolCall && tools.length && !resultText) {
-      // arko 完全沒內容 → 用第一個工具自動產生 mock tool call（讓 OpenCode 可以去調用 MCP tool）
+    if (!toolCall && tools.length) {
+      // 用第一個工具自動產生 mock tool call（讓 OpenCode 可以去調用 MCP tool）
       const firstDef = extractToolDef(tools[0])
       if (firstDef) {
         const argsObj = {}
