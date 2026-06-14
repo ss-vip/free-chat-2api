@@ -34,18 +34,24 @@ export async function hashPassword(password) {
 }
 
 export async function verifyPassword(password, stored) {
-  if (!stored) return { ok: true, needsUpgrade: false }
+  if (!stored) return true
   if (stored.startsWith('pbkdf2:')) {
     const parts = stored.split(':')
-    if (parts.length !== 4) return { ok: false, needsUpgrade: false }
+    if (parts.length !== 4) return false
     const iterations = parseInt(parts[1], 10)
     const salt = parts[2]
     const expected = parts[3]
     const computed = await pbkdf2Hash(password, salt, iterations)
-    return { ok: computed === expected, needsUpgrade: false }
+    return computed === expected
   }
   const legacy = await sha256(password)
-  return { ok: legacy === stored, needsUpgrade: legacy === stored }
+  return legacy === stored
+}
+
+export async function verifyPasswordWithMeta(password, stored) {
+  const ok = await verifyPassword(password, stored)
+  const needsUpgrade = ok && !stored?.startsWith?.('pbkdf2:')
+  return { ok, needsUpgrade }
 }
 
 export function generateSessionToken() {

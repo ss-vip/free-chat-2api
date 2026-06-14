@@ -1,4 +1,4 @@
-name = "free-chat-2api"
+name = "arko-2api"
 main = "src/index.js"
 compatibility_date = "2026-05-18"
 compatibility_flags = ["nodejs_compat"]
@@ -14,5 +14,5 @@ fallthrough = true
 # D1 資料庫
 [[d1_databases]]
 binding = "DB"
-database_name = "free-chat-2api-db"
+database_name = "arko-2api-db"
 database_id = "your-db-uuid"
