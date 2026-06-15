@@ -4,7 +4,7 @@ import {
   initDB, getClientToken, rotateClientToken,
   getDashboardPasswordHash, setDashboardPasswordHash,
   getProvider, updateProvider, sanitizeProvider,
-  proxyWithArkoFallback, testProviderConnection, cleanupOldChats, listAgents,
+  proxyArko, testProviderConnection, cleanupOldChats, listAgents,
   createSession, getValidSession, deleteSession, deleteExpiredSessions
 } from './lib/db.js'
 import {
@@ -168,11 +168,11 @@ app.post('/api/playground/chat', async (c) => {
   if (!(await requireAuth(c))) return c.json({ error: '未登入' }, 401)
   const { model, messages, ...rest } = await c.req.json()
   const provider = await getProvider(c.env.DB)
-  const providers = provider ? [{ ...provider, enabled: true, priority: 1, type: 'arko', name: 'default' }] : []
+  if (!provider) return c.json({ error: '尚未設定提供者' }, 404)
   const stream = rest.stream !== false
   const payload = { model, messages, stream, ...rest }
   try {
-    const result = await proxyWithArkoFallback(providers, model, payload, stream, c.env.DB)
+    const result = await proxyArko(provider, payload, stream, c.env.DB)
     if (result instanceof Response) return result
     return c.json(result)
   } catch (e) {
@@ -205,11 +205,11 @@ app.post('/v1/chat/completions', async (c) => {
   const body = await c.req.json()
   const { model, messages, ...rest } = body
   const provider = await getProvider(c.env.DB)
-  const providers = provider ? [{ ...provider, enabled: true, priority: 1, type: 'arko', name: 'default' }] : []
+  if (!provider) return c.json({ error: 'No provider configured' }, 503)
   const stream = rest.stream !== false
   const payload = { model, messages, stream, ...rest }
   try {
-    const result = await proxyWithArkoFallback(providers, model, payload, stream, c.env.DB)
+    const result = await proxyArko(provider, payload, stream, c.env.DB)
     if (result instanceof Response) return result
     return c.json(result)
   } catch (e) {
@@ -421,8 +421,10 @@ const DASHBOARD_SCRIPT = [
   '    var models = ""',
   '    try { models = p && p.models ? JSON.parse(p.models).join(", ") : "" } catch(e) {}',
   '    document.getElementById("providerModels").value = models',
-'    document.getElementById("providerApiKey").value = (p && p.api_key) || ""',
-'    document.getElementById("providerApiKeyHint").textContent = (p && p.api_key_set) ? "✅ 已設定 API Key，修改後自動更新" : "⚠️ API Key 尚未設定（必填）"',
+'    document.getElementById("providerApiKey").value = ""',
+'    var keySet = p && p.api_key_set',
+'    document.getElementById("providerApiKeyHint").textContent = keySet ? "✅ 已設定" : "⚠️ 尚未設定（必填）"',
+'    document.getElementById("clearKeyBtn").style.display = keySet ? "inline-block" : "none"',
   '  } catch(e) {}',
   '}',
   '',
@@ -456,10 +458,25 @@ const DASHBOARD_SCRIPT = [
   '    const d = await r.json()',
   '    if (d.ok) toast("連線成功 (" + d.status + ")", "success")',
   '    else toast("連線失敗: " + (d.error || d.status || "未知錯誤"), "danger")',
-  '  } catch(e) { toast("測試失敗: " + e.message, "danger") }',
-  '}',
-  '',
-  'async function loadSettings() {',
+'  } catch(e) { toast("測試失敗: " + e.message, "danger") }',
+'}',
+'',
+'async function clearApiKey() {',
+'  if (!confirm("確定清除 API Key？")) return',
+'  document.getElementById("providerFormError").textContent = ""',
+'  try {',
+'    const r = await api("/api/provider", {',
+'      method: "PUT", headers: { "Content-Type": "application/json" },',
+'      body: JSON.stringify({ clear_api_key: true })',
+'    })',
+'    const d = await r.json()',
+'    if (!r.ok) { document.getElementById("providerFormError").textContent = d.error || "清除失敗"; return }',
+'    toast("API Key 已清除", "success")',
+'    loadProvider()',
+'  } catch(e) { document.getElementById("providerFormError").textContent = e.message || "清除失敗" }',
+'}',
+'',
+'async function loadSettings() {',
   '  const r = await api("/api/client-token")',
   '  const d = await r.json()',
   '  document.getElementById("clientTokenDisplay").textContent = d.token || "（無）"',
@@ -556,32 +573,32 @@ const DASHBOARD_SCRIPT = [
   'function renderHistory() {',
   '  var el = document.getElementById("convList")',
   '  if (!el) return',
-  '  var history = JSON.parse(localStorage.getItem("chatHistory") || "[]")',
-  '  history.sort(function(a,b) { return b.ts - a.ts })',
-  '  localStorage.setItem("chatHistory", JSON.stringify(history))',
-  '  var html = ""',
-  '  html += "<button class=\"list-group-item list-group-item-action\" onclick=\"startNewChat()\"><strong>＋ 發起新對話</strong></button>"',
-  '  history.forEach(function(h, idx) {',
-  '    html += "<div class=\"list-group-item list-group-item-action d-flex justify-content-between align-items-center\" data-index=\"" + idx + "\" onclick=\"loadHistory(this)\">"',
-  '    html += "<span class=\"text-truncate\" style=\"max-width:160px\">" + esc(h.title) + "</span>"',
-  '    html += "<button class=\"btn btn-sm btn-outline-danger\" data-index=\"" + idx + "\" onclick=\"event.stopPropagation();deleteHistory(this)\">✕</button>"',
-  '    html += "</div>"',
-  '  })',
+'  var history = JSON.parse(localStorage.getItem("chatHistory") || "[]")',
+'  var sorted = history.slice().sort(function(a,b) { return b.ts - a.ts })',
+'  var html = ""',
+'  html += "<button class=\'list-group-item list-group-item-action\' onclick=\'startNewChat()\'><strong>＋ 發起新對話</strong></button>"',
+'  sorted.forEach(function(h, idx) {',
+'    html += "<div class=\'list-group-item list-group-item-action d-flex justify-content-between align-items-center\' data-index=\'" + idx + "\' onclick=\'loadHistory(this)\'>"',
+'    html += "<span class=\'text-truncate\' style=\'max-width:160px\'>" + esc(h.title) + "</span>"',
+'    html += "<button class=\'btn btn-sm btn-outline-danger\' data-index=\'" + idx + "\' onclick=\'event.stopPropagation();deleteHistory(this)\'>✕</button>"',
+'    html += "</div>"',
+'  })',
   '  el.innerHTML = html',
   '}',
   '',
-  'function startNewChat() {',
-  '  document.getElementById("chatBox").innerHTML = ""',
-  '  chatCid = ""',
-  '  if (abortController) { abortController.abort(); abortController = null }',
-  '}',
+'function startNewChat() {',
+'  saveCurrentHistory()',
+'  document.getElementById("chatBox").innerHTML = ""',
+'  chatCid = ""',
+'  if (abortController) { abortController.abort(); abortController = null }',
+'}',
   '',
-  'function loadHistory(el) {',
-  '  var idx = parseInt(el.dataset.index)',
-  '  var history = JSON.parse(localStorage.getItem("chatHistory") || "[]")',
-  '  history.sort(function(a,b) { return b.ts - a.ts })',
-  '  if (idx < 0 || idx >= history.length) return',
-  '  var entry = history[idx]',
+'function loadHistory(el) {',
+'  var idx = parseInt(el.dataset.index)',
+'  var history = JSON.parse(localStorage.getItem("chatHistory") || "[]")',
+'  var sorted = history.slice().sort(function(a,b) { return b.ts - a.ts })',
+'  if (idx < 0 || idx >= sorted.length) return',
+'  var entry = sorted[idx]',
   '  document.getElementById("chatBox").innerHTML = ""',
   '  chatCid = entry.cid || ""',
   '  if (abortController) { abortController.abort(); abortController = null }',
@@ -598,14 +615,17 @@ const DASHBOARD_SCRIPT = [
   '  if (window.hljs) enhanceCode(document.getElementById("chatBox"))',
   '}',
   '',
-  'function deleteHistory(el) {',
-  '  var idx = parseInt(el.dataset.index)',
-  '  var history = JSON.parse(localStorage.getItem("chatHistory") || "[]")',
-  '  history.sort(function(a,b) { return b.ts - a.ts })',
-  '  history.splice(idx, 1)',
-  '  localStorage.setItem("chatHistory", JSON.stringify(history))',
-  '  renderHistory()',
-  '}',
+'function deleteHistory(el) {',
+'  var idx = parseInt(el.dataset.index)',
+'  var history = JSON.parse(localStorage.getItem("chatHistory") || "[]")',
+'  var sorted = history.slice().sort(function(a,b) { return b.ts - a.ts })',
+'  if (idx < 0 || idx >= sorted.length) return',
+'  var entry = sorted[idx]',
+'  var realIdx = history.indexOf(entry)',
+'  if (realIdx >= 0) history.splice(realIdx, 1)',
+'  localStorage.setItem("chatHistory", JSON.stringify(history))',
+'  renderHistory()',
+'}',
   '',
   'function clearAllHistory() {',
   '  if (!confirm("確定刪除所有歷史對話？")) return',
@@ -663,14 +683,14 @@ const DASHBOARD_SCRIPT = [
   '    var r = await fetch(API_BASE + "/api/playground/chat", {',
   '      method: "POST", credentials: "include",',
   '      headers: { "Content-Type": "application/json" },',
-  '      body: JSON.stringify({ model: model, messages: messages, stream: false, cid: chatCid || undefined }),',
+  '      body: JSON.stringify({ model: model, messages: messages, stream: true, cid: chatCid || undefined }),',
   '      signal: abortController.signal',
   '    })',
   '    if (!r.ok) { var ej = await r.json(); throw new Error(ej.error || r.statusText) }',
   '    var contentType = r.headers.get("Content-Type") || ""',
   '    if (!contentType.includes("text/event-stream") && !contentType.includes("text/plain")) {',
   '      var json = await r.json()',
-  '      var text = (json.choices && json.choices[0] && (json.choices[0].message && json.choices[0].message.content || json.choices[0].text)) || JSON.stringify(json)',
+  '      var text = json?.choices?.[0]?.message?.content ?? json?.choices?.[0]?.text ?? JSON.stringify(json)',
 '      msgEl.dataset.raw = text',
 '      msgEl.innerHTML = window.marked ? marked.parse(text) : esc(text)',
 '      if (window.hljs) enhanceCode(msgEl)',
@@ -697,7 +717,7 @@ const DASHBOARD_SCRIPT = [
   '        if (data === "[DONE]") continue',
   '        try {',
   '          var parsed = JSON.parse(data)',
-  '          var content = (parsed.choices && parsed.choices[0] && (parsed.choices[0].delta && parsed.choices[0].delta.content || parsed.choices[0].text)) || ""',
+  '          var content = parsed?.choices?.[0]?.delta?.content ?? parsed?.choices?.[0]?.text ?? ""',
   '          if (content) {',
   '            if (!hasStarted) { hasStarted = true; msgEl.innerHTML = "" }',
   '            fullText += content',
@@ -709,7 +729,47 @@ const DASHBOARD_SCRIPT = [
   '      }',
   '      chatBox.scrollTop = chatBox.scrollHeight',
   '    }',
-'  if (!fullText && !hasStarted) msgEl.textContent = "（無回應內容—請檢查伺服器日誌）"',
+'  if (!fullText && !hasStarted) {',
+'    // SSE empty — retry without CID (start fresh) via streaming',
+'    try {',
+'      var r2 = await fetch(API_BASE + "/api/playground/chat", {',
+'        method: "POST", credentials: "include",',
+'        headers: { "Content-Type": "application/json" },',
+'        body: JSON.stringify({ model: model, messages: messages, stream: true }),',
+'        signal: abortController.signal',
+'      })',
+'      if (r2.ok) {',
+'        var reader2 = r2.body.getReader()',
+'        var buf2 = ""',
+'        while (true) {',
+'          var c2 = await reader2.read()',
+'          if (c2.done) break',
+'          buf2 += new TextDecoder().decode(c2.value, { stream: true })',
+'          var ls2 = buf2.split("\\n")',
+'          buf2 = ls2.pop() || ""',
+'          for (var j = 0; j < ls2.length; j++) {',
+'            var ln = ls2[j]',
+'            if (!ln.startsWith("data: ")) continue',
+'            var d2 = ln.slice(6)',
+'            if (d2 === "[DONE]") continue',
+'            try {',
+'              var p2 = JSON.parse(d2)',
+'              var ct2 = p2?.choices?.[0]?.delta?.content ?? ""',
+'              if (ct2) {',
+'                if (!hasStarted) { hasStarted = true; msgEl.innerHTML = "" }',
+'                fullText += ct2',
+'                msgEl.dataset.raw = fullText',
+'                msgEl.innerHTML = window.marked ? marked.parse(fullText) : esc(fullText)',
+'              }',
+'              if (p2._cid) chatCid = p2._cid',
+'            } catch(e) {}',
+'          }',
+'          chatBox.scrollTop = chatBox.scrollHeight',
+'        }',
+'      }',
+'    } catch(e) {}',
+'    if (!fullText) msgEl.textContent = "\uff08\u7121\u56de\u61c9\u5167\u5bb9\uff09"',
+'  }',
 '  if (fullText && window.hljs) enhanceCode(msgEl)',
   '  } catch(e) {',
   '    if (e.name !== "AbortError") {',
@@ -758,9 +818,8 @@ const DASHBOARD_SCRIPT = [
 '  })',
 '}',
 '',
-'document.getElementById("temperature").addEventListener("input", function() { document.getElementById("tempVal").textContent = this.value })',
 'document.getElementById("userInput").addEventListener("input", function() { this.style.height = "auto"; this.style.height = Math.min(this.scrollHeight, 160) + "px" })',
-'document.getElementById("userInput").addEventListener("keydown", function(event) { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendPlayground() } })',
+';document.getElementById("userInput").addEventListener("keydown", function(e) { if (e.key === "Enter" && e.shiftKey) { e.preventDefault(); sendPlayground() } })',
 ].join('\n')
 
 function dashboardHtml(origin) {
@@ -815,11 +874,11 @@ body{font-family:'Inter',sans-serif;background:var(--bg-gradient);background-att
 .welcome-section{text-align:center;padding:3rem 1rem}
 .welcome-section h1{font-size:2.5rem;margin-bottom:.5rem;font-weight:600;background:linear-gradient(to right,#fff,#0dcaf0);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .chat-box{overflow-y:auto;border:1px solid var(--glass-border);border-radius:12px;padding:1.5rem;background:rgba(0,0,0,0.15);box-shadow:inset 0 2px 10px rgba(0,0,0,0.1)}
-.chat-box .msg{margin-bottom:1rem;padding:0.85rem 1.2rem;border-radius:12px;max-width:85%;animation:slideIn 0.3s cubic-bezier(0.16,1,0.3,1);line-height:1.6}
-@keyframes slideIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-.chat-box .msg.user{background:linear-gradient(135deg,#0dcaf0 0%,#087990 100%);color:#fff;margin-left:auto;border-bottom-right-radius:4px;box-shadow:0 4px 15px rgba(13,202,240,0.2)}
+.chat-box .msg{margin-bottom:1rem;padding:0.85rem 1.2rem;border-radius:12px;max-width:85%;animation:slideIn 0.3s cubic-bezier(0.16,1,0.3,1);line-height:1.6;word-wrap:break-word}
+@keyframes slideIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+.chat-box .msg.user{background:linear-gradient(135deg,#6c757d 0%,#495057 100%);color:#e2e8f0;margin-left:auto;border-bottom-right-radius:4px;box-shadow:0 4px 15px rgba(108,117,125,0.2)}
 .chat-box .msg.assistant{background:var(--glass-bg);color:#e2e8f0;border-bottom-left-radius:4px;border:1px solid var(--glass-border);box-shadow:0 4px 15px rgba(0,0,0,0.1)}
-.chat-box .msg.assistant p:last-child { margin-bottom: 0; }
+.chat-box .msg.assistant p:last-child{margin-bottom:0}
 .chat-box .msg.assistant pre { background: rgba(0,0,0,0.3); border-radius: 8px; padding: 1rem; border: 1px solid var(--glass-border); overflow-x: auto; margin: 0; border-top-left-radius: 0; border-top-right-radius: 0; }
 .chat-box .msg.assistant .code-wrapper { margin-bottom: 1rem; border-radius: 8px; overflow: hidden; }
 .chat-box .msg.assistant .code-header { display: flex; justify-content: space-between; align-items: center; padding: 0.35rem 0.75rem; background: rgba(0,0,0,0.4); border: 1px solid var(--glass-border); border-bottom: none; border-radius: 8px 8px 0 0; }
@@ -933,7 +992,10 @@ body{font-family:'Inter',sans-serif;background:var(--bg-gradient);background-att
           <div class="col-md-6">
             <label class="form-label">API Key</label>
             <input type="text" class="form-control" id="providerApiKey" placeholder="必填">
-            <div class="form-text text-secondary" id="providerApiKeyHint">請輸入 API Key</div>
+            <div class="d-flex align-items-center gap-2 mt-1">
+              <div class="form-text text-secondary mb-0" id="providerApiKeyHint">請輸入 API Key</div>
+              <button type="button" class="btn btn-outline-danger btn-sm py-0" id="clearKeyBtn" style="display:none" onclick="clearApiKey()">清除 Key</button>
+            </div>
           </div>
           <div class="col-md-6">
             <label class="form-label">上游 Agent ID (必填)</label>
@@ -1015,7 +1077,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg-gradient);background-att
       </div>
       <div class="chat-box" id="chatBox"></div>
       <div class="input-group">
-        <textarea class="form-control" id="userInput" placeholder="輸入訊息... (Enter 發送, Shift+Enter 換行)" rows="2" style="resize:none"></textarea>
+        <textarea class="form-control" id="userInput" placeholder="輸入訊息... (Shift+Enter 發送, Enter 換行)" rows="3" style="resize:none"></textarea>
         <button class="btn btn-info" id="playgroundSend" onclick="sendPlayground()">發送</button>
       </div>
     </div>
