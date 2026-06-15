@@ -435,7 +435,7 @@ const DASHBOARD_SCRIPT = [
   '  base_url = base_url.replace(/\\/+$/, "") || "https://arko.arcaelas.com"',
   '  document.getElementById("providerBaseUrl").value = base_url',
   '  if (!base_url) { errEl.textContent = "請輸入 API 網址"; return }',
-  '  if (!upstream_model) { errEl.textContent = "請輸入 Agent ID (上游提供者)"; return }',
+  '  if (!upstream_model) { errEl.textContent = "請輸入 Agent ID (上游提供者，多個以逗號分隔)"; return }',
   '  errEl.textContent = ""',
   '  var models = modelsRaw ? modelsRaw.split(",").map(function(s) { return s.trim() }).filter(Boolean) : ["*"]',
   '  var body = { base_url: base_url, upstream_model: upstream_model, models: models }',
@@ -518,12 +518,99 @@ const DASHBOARD_SCRIPT = [
   '  if (models.length > 0) {',
   '    sel.value = seen.has("openai") ? "openai" : models[0].id',
   '  }',
+  '  renderHistory()',
   '}',
   '',
   'function clearChat() {',
+  '  saveCurrentHistory()',
   '  document.getElementById("chatBox").innerHTML = ""',
   '  chatCid = ""',
   '  if (abortController) { abortController.abort(); abortController = null }',
+  '}',
+  '',
+  'function saveCurrentHistory() {',
+  '  var bubbles = document.querySelectorAll("#chatBox .msg")',
+  '  if (!bubbles.length) return',
+  '  var msgs = []',
+  '  var systemPrompt = document.getElementById("systemPrompt").value.trim()',
+  '  if (systemPrompt && bubbles.length) msgs.push({ role: "system", content: systemPrompt })',
+  '  bubbles.forEach(function(el) {',
+  '    var text = el.dataset.raw || el.textContent',
+  '    if (el.classList.contains("user")) msgs.push({ role: "user", content: text })',
+  '    if (el.classList.contains("assistant") && text.trim()) msgs.push({ role: "assistant", content: text })',
+  '  })',
+  '  if (!msgs.length) return',
+  '  var title = msgs[0]?.content?.slice(0,50) || "對話"',
+  '  var history = JSON.parse(localStorage.getItem("chatHistory") || "[]")',
+  '  var firstUser = ""',
+  '  for (var i = 0; i < msgs.length; i++) { if (msgs[i].role === "user") { firstUser = msgs[i].content.slice(0,50); break } }',
+  '  var key = firstUser || title',
+  '  var existing = -1',
+  '  for (var i = 0; i < history.length; i++) { if (history[i].key === key) { existing = i; break } }',
+  '  var entry = { key: key, title: title, msgs: msgs, cid: chatCid, ts: Date.now() }',
+  '  if (existing >= 0) { history[existing] = entry } else { history.unshift(entry) }',
+  '  localStorage.setItem("chatHistory", JSON.stringify(history))',
+  '  renderHistory()',
+  '}',
+  '',
+  'function renderHistory() {',
+  '  var el = document.getElementById("convList")',
+  '  if (!el) return',
+  '  var history = JSON.parse(localStorage.getItem("chatHistory") || "[]")',
+  '  history.sort(function(a,b) { return b.ts - a.ts })',
+  '  localStorage.setItem("chatHistory", JSON.stringify(history))',
+  '  var html = ""',
+  '  html += "<button class=\"list-group-item list-group-item-action\" onclick=\"startNewChat()\"><strong>＋ 發起新對話</strong></button>"',
+  '  history.forEach(function(h, idx) {',
+  '    html += "<div class=\"list-group-item list-group-item-action d-flex justify-content-between align-items-center\" data-index=\"" + idx + "\" onclick=\"loadHistory(this)\">"',
+  '    html += "<span class=\"text-truncate\" style=\"max-width:160px\">" + esc(h.title) + "</span>"',
+  '    html += "<button class=\"btn btn-sm btn-outline-danger\" data-index=\"" + idx + "\" onclick=\"event.stopPropagation();deleteHistory(this)\">✕</button>"',
+  '    html += "</div>"',
+  '  })',
+  '  el.innerHTML = html',
+  '}',
+  '',
+  'function startNewChat() {',
+  '  document.getElementById("chatBox").innerHTML = ""',
+  '  chatCid = ""',
+  '  if (abortController) { abortController.abort(); abortController = null }',
+  '}',
+  '',
+  'function loadHistory(el) {',
+  '  var idx = parseInt(el.dataset.index)',
+  '  var history = JSON.parse(localStorage.getItem("chatHistory") || "[]")',
+  '  history.sort(function(a,b) { return b.ts - a.ts })',
+  '  if (idx < 0 || idx >= history.length) return',
+  '  var entry = history[idx]',
+  '  document.getElementById("chatBox").innerHTML = ""',
+  '  chatCid = entry.cid || ""',
+  '  if (abortController) { abortController.abort(); abortController = null }',
+  '  for (var j = 0; j < entry.msgs.length; j++) {',
+  '    var m = entry.msgs[j]',
+  '    if (m.role === "system") { document.getElementById("systemPrompt").value = m.content; continue }',
+  '    var d = document.createElement("div")',
+  '    d.className = "msg " + m.role',
+  '    d.dataset.raw = m.content',
+  '    if (m.role === "user") { d.textContent = m.content }',
+  '    else { d.innerHTML = window.marked ? marked.parse(m.content) : esc(m.content) }',
+  '    document.getElementById("chatBox").appendChild(d)',
+  '  }',
+  '  if (window.hljs) enhanceCode(document.getElementById("chatBox"))',
+  '}',
+  '',
+  'function deleteHistory(el) {',
+  '  var idx = parseInt(el.dataset.index)',
+  '  var history = JSON.parse(localStorage.getItem("chatHistory") || "[]")',
+  '  history.sort(function(a,b) { return b.ts - a.ts })',
+  '  history.splice(idx, 1)',
+  '  localStorage.setItem("chatHistory", JSON.stringify(history))',
+  '  renderHistory()',
+  '}',
+  '',
+  'function clearAllHistory() {',
+  '  if (!confirm("確定刪除所有歷史對話？")) return',
+  '  localStorage.removeItem("chatHistory")',
+  '  renderHistory()',
   '}',
 'var abortController = null',
 'var chatCid = ""',
@@ -550,8 +637,7 @@ const DASHBOARD_SCRIPT = [
 '  if (!msg) return',
 '  var model = document.getElementById("playgroundModel").value',
 '  if (!model) { toast("請選擇模型", "warning"); return }',
-  '  var temp = parseFloat(document.getElementById("temperature").value) || 0.7',
-  '  var maxTokens = parseInt(document.getElementById("maxTokens").value) || 2048',
+  '  saveCurrentHistory()',
   '  var chatBox = document.getElementById("chatBox")',
   '  var messages = buildConversationHistory()',
   '  messages.push({ role: "user", content: msg })',
@@ -577,7 +663,7 @@ const DASHBOARD_SCRIPT = [
   '    var r = await fetch(API_BASE + "/api/playground/chat", {',
   '      method: "POST", credentials: "include",',
   '      headers: { "Content-Type": "application/json" },',
-  '      body: JSON.stringify({ model: model, messages: messages, stream: true, temperature: temp, max_tokens: maxTokens, cid: chatCid || undefined }),',
+  '      body: JSON.stringify({ model: model, messages: messages, stream: false, cid: chatCid || undefined }),',
   '      signal: abortController.signal',
   '    })',
   '    if (!r.ok) { var ej = await r.json(); throw new Error(ej.error || r.statusText) }',
@@ -851,8 +937,8 @@ body{font-family:'Inter',sans-serif;background:var(--bg-gradient);background-att
           </div>
           <div class="col-md-6">
             <label class="form-label">上游 Agent ID (必填)</label>
-            <input type="text" class="form-control" id="providerUpstreamModel" placeholder="arko agent UUID" required>
-            <div class="form-text text-secondary">對應 Arko Studio 的 Agent ID</div>
+            <input type="text" class="form-control" id="providerUpstreamModel" placeholder="uuid1, uuid2, ..." required>
+            <div class="form-text text-secondary">對應 Arko Studio 的 Agent ID，多個以逗號分隔自動輪詢</div>
           </div>
           <div class="col-md-6">
             <label class="form-label">模型</label>
@@ -914,18 +1000,12 @@ body{font-family:'Inter',sans-serif;background:var(--bg-gradient);background-att
         <label class="form-label">System Prompt</label>
         <textarea class="form-control" id="systemPrompt" rows="3" placeholder="可選的系統提示"></textarea>
       </div>
-      <div class="mb-3">
-        <label class="form-label">Temperature</label>
-        <input type="range" class="form-range" id="temperature" min="0" max="2" step="0.1" value="0.7">
-        <span class="small text-secondary" id="tempVal">0.7</span>
-      </div>
-      <div class="mb-3">
-        <label class="form-label">Max Tokens</label>
-        <input type="number" class="form-control" id="maxTokens" value="2048" min="1" max="128000">
-      </div>
-      <div class="form-check mb-3">
-        <input class="form-check-input" type="checkbox" id="streamToggle" checked>
-        <label class="form-check-label">串流輸出</label>
+      <div id="convHistory">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <label class="form-label mb-0">歷史對話</label>
+          <button class="btn btn-outline-danger btn-sm" onclick="clearAllHistory()">全部刪除</button>
+        </div>
+        <div id="convList" class="list-group list-group-flush" style="max-height:300px;overflow-y:auto"></div>
       </div>
     </div>
     <div class="col-md-9">

@@ -1,6 +1,8 @@
 # arko-2api
 
-[Arko Studio](https://arko.arcaelas.com) 的 agent API 轉換為 OpenAI 相容格式的 API 服務。
+- [Arko Studio](https://arko.arcaelas.com) 的 agent API 轉換為 OpenAI 相容格式的 API 服務。
+- 有管理介面，可以設定多個 agent uuid 自動輪詢。
+- 有 playground 可以測試對話、圖片生成，有 markdown 渲染。
 
 ## 前置
 
@@ -29,9 +31,7 @@ npx wrangler d1 create arko-2api-db
 npx wrangler deploy
 ```
 
-| `POST /api/provider/test` | 測試連線 |
-
-### OpenAI 相容
+### 測試連線
 
 ```bash
 curl https://your-worker.workers.dev/v1/chat/completions \
@@ -54,4 +54,4 @@ curl https://your-worker.workers.dev/v1/chat/completions \
 
 ### 定時清除舊對話
 
-`/health` 路由會自動將所有已啟用的渠道 agent 做刪除今日之前的所有對話，可透過 cronjob 定時每小時觸發。
+`/health` 路由會自動將所有 agent 刪除今日之前的所有對話，可透過 cronjob 定時每小時觸發。

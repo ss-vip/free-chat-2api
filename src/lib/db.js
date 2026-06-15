@@ -178,7 +178,7 @@ export function findProvidersForModel(providers, model) {
       return m.includes('*') || m.includes('all')
     } catch { return false }
   })
-  return wildcard.length ? wildcard : sorted
+  return wildcard
 }
 
 // ── Arko helpers ──────────────────────────────────────────────────
@@ -614,6 +614,7 @@ function openAICompletion(model, text, toolCall, cid) {
 // ── Core proxy ────────────────────────────────────────────────────
 const sleep = (ms) => new Promise(r => setTimeout(r, ms))
 const lastArkoCall = new Map()
+let aidRotateCounter = 0
 
 export async function proxyArko(provider, payload, stream, db) {
   const messages = payload.messages || []
@@ -621,7 +622,8 @@ export async function proxyArko(provider, payload, stream, db) {
   const hasTools = !!(tools.length)
   const lastMsg = messages[messages.length - 1] || {}
   const model = payload.model || 'arko'
-  const aid = provider.upstream_model || payload.model
+  const aid = provider.upstream_model
+  if (!aid) throw new Error('Arko provider has no upstream_model configured')
   const toolChoice = payload.tool_choice
   const toolsActive = hasTools && toolChoice !== 'none'
 
@@ -781,58 +783,74 @@ export async function proxyArko(provider, payload, stream, db) {
   }
 
   // Non-tool path: plain text to arko
-  // Resolve cid from conversation context hash (only user messages → stable across retries)
-  let resolvedCid = payload.cid || null
-  if (!resolvedCid && db && messages?.length >= 2) {
-    const userMsgs = messages.slice(0, -1).filter(m => m.role === 'user').map(m => m.content)
-    if (userMsgs.length) {
-      const hashStr = JSON.stringify(userMsgs)
-      const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(hashStr))
-      const ctxHash = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 64)
-      const row = await db.prepare('SELECT cid FROM chat_cids WHERE ctx_hash = ?').bind(ctxHash).first()
-      if (row?.cid) resolvedCid = row.cid
+  const aids = aid.split(',').map(s => s.trim()).filter(Boolean)
+  const allUserMsgs = messages.filter(m => m.role === 'user').map(m => m.content)
+
+  // Determine AID order: if existing CID found, pin to that AID; otherwise rotate
+  let aidOrder, ctxHash
+  const prevMsgs = allUserMsgs.slice(0, allUserMsgs.length - (messages[messages.length - 1]?.role === 'user' ? 1 : 0))
+  if (db && prevMsgs.length) {
+    const hashStr = JSON.stringify(prevMsgs)
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(hashStr))
+    ctxHash = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 64)
+    // Find which AID has an existing CID for this conversation
+    const existing = await db.prepare(
+      'SELECT aid FROM chat_cids WHERE ctx_hash = ? AND aid IN (' + aids.map(() => '?').join(',') + ') LIMIT 1'
+    ).bind(ctxHash, ...aids).first()
+    if (existing?.aid) {
+      // Pin to the AID that has context; remaining AIDs as fallback in original order
+      aidOrder = [existing.aid, ...aids.filter(a => a !== existing.aid)]
     }
+  }
+  if (!aidOrder) {
+    // New conversation: rotate start AID for load balancing
+    const offset = (aidRotateCounter++) % aids.length
+    aidOrder = [...aids.slice(offset), ...aids.slice(0, offset)]
   }
 
-  for (let attempt = 0; attempt < 2; attempt++) {
-    if (attempt > 0) await sleep(500)
-    // Per-agent throttle: at least 2s between calls to the same agent
-    const now = Date.now()
-    const lastTime = lastArkoCall.get(aid) || 0
-    if (now - lastTime < 2000) await sleep(2000 - (now - lastTime))
-    lastArkoCall.set(aid, Date.now())
-    const body = { content: contentWithSystem, stream: true, aid, ...(attempt === 0 && resolvedCid ? { cid: resolvedCid } : {}) }
-    try {
-      const resp = await callArko(body, 8000)
-      
-      const parsed = await readArkoStream(resp)
-      if (parsed.content) {
-        // Save cid keyed by all user messages (stable for next turn)
-        if (db && parsed.chatId && messages?.length) {
-          const allUserMsgs = [...messages.filter(m => m.role === 'user').map(m => m.content)]
-          if (allUserMsgs.length) {
-            const hashStr = JSON.stringify(allUserMsgs)
-            const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(hashStr))
-            const newHash = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 64)
-            await db.prepare(
-              'INSERT OR REPLACE INTO chat_cids (ctx_hash, cid, aid, updated_at) VALUES (?, ?, ?, datetime(\'now\'))'
-            ).bind(newHash, parsed.chatId, aid || '').run()
+  let lastErr = null
+  for (let cycle = 0; cycle < 3; cycle++) {
+    for (const currentAid of aidOrder) {
+      // Per-agent throttle: at least 1s between calls to the same agent
+      const now = Date.now()
+      const lastTime = lastArkoCall.get(currentAid) || 0
+      if (now - lastTime < 1000) await sleep(1000 - (now - lastTime))
+      lastArkoCall.set(currentAid, Date.now())
+
+      // Resolve cid for this specific AID
+      let resolvedCid = payload.cid || null
+      if (!resolvedCid && db && prevMsgs.length && ctxHash) {
+        const row = await db.prepare('SELECT cid FROM chat_cids WHERE ctx_hash = ? AND aid = ?').bind(ctxHash, currentAid).first()
+        if (row?.cid) resolvedCid = row.cid
+      }
+
+      const body = { content: contentWithSystem, stream: true, aid: currentAid, ...(resolvedCid ? { cid: resolvedCid } : {}) }
+      try {
+        const resp = await callArko(body, 8000)
+        const parsed = await readArkoStream(resp)
+        if (parsed.content) {
+          // Save cid keyed by all user messages (stable for next turn)
+          if (db && parsed.chatId && messages?.length) {
+            if (allUserMsgs.length) {
+              const hashStr = JSON.stringify(allUserMsgs)
+              const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(hashStr))
+              const newHash = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 64)
+              await db.prepare(
+                'INSERT OR REPLACE INTO chat_cids (ctx_hash, cid, aid, updated_at) VALUES (?, ?, ?, datetime(\'now\'))'
+              ).bind(newHash, parsed.chatId, currentAid).run()
+            }
           }
+          return returnText(parsed.content, parsed.chatId)
         }
-        return returnText(parsed.content, parsed.chatId)
+        // empty content → fall through
+      } catch (e) {
+        lastErr = e
       }
-    } catch (e) {
-      if (attempt === 0 && resolvedCid && db) {
-        try {
-          await db.prepare('DELETE FROM chat_cids WHERE cid = ?').bind(resolvedCid).run()
-        } catch (dbErr) {
-          console.error('Failed to clean up invalid cid from D1:', dbErr)
-        }
-      }
-      if (attempt >= 1) throw e
+
+      await sleep(500) // delay before next attempt
     }
   }
-  throw new Error('Arko returned empty content after retries')
+  throw new Error('Arko returned empty content after retries' + (lastErr ? ': ' + lastErr.message : ''))
 }
 
 // ── Fallback: try arko providers in priority order ────────────────
