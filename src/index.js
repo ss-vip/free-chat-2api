@@ -154,14 +154,13 @@ app.post('/api/client-token/rotate', async (c) => {
 // ---- Models ----
 function parseModels(provider) {
   if (!provider) return []
-  try { return JSON.parse(provider.models || '["*"]') } catch { return ['*'] }
+  try { return JSON.parse(provider.models || '["openai"]') } catch { return ['openai'] }
 }
 
 app.get('/api/models', async (c) => {
   if (!(await requireAuth(c))) return c.json({ error: '未登入' }, 401)
   const provider = await getProvider(c.env.DB)
-  const models = parseModels(provider)
-  return c.json(models.map(m => ({ id: m, provider_name: 'arko' })))
+  return c.json([{ id: 'openai', name: 'openai', provider_name: 'arko' }])
 })
 
 // ---- Playground ----
@@ -186,15 +185,15 @@ app.get('/v1/models', async (c) => {
   const stored = await getClientToken(c.env.DB)
   if (!stored || token !== stored) return c.json({ error: 'Unauthorized' }, 401)
   const provider = await getProvider(c.env.DB)
-  const models = parseModels(provider)
+  if (!provider) return c.json({ object: 'list', data: [] })
   return c.json({
     object: 'list',
-    data: models.map(m => ({
-      id: m,
+    data: [{
+      id: 'openai',
       object: 'model',
       created: Math.floor(Date.now() / 1000),
       owned_by: 'free-chat-api'
-    }))
+    }]
   })
 })
 
@@ -266,7 +265,7 @@ app.get('/health', async (c) => {
     // Cleanup old chats for all discovered agents (skip rediscovery)
     let cleanup = null
     try {
-      cleanup = await cleanupOldChats(provider, '', agents.map(a => a.id))
+      cleanup = await cleanupOldChats(provider, '', agents.map(a => a.id), c.env.DB)
     } catch (e) {
       cleanup = { error: e.message }
     }
@@ -297,6 +296,387 @@ app.all('*', (c) => c.text('Not Found', 404))
 export default app
 
 // ── HTML template ─────────────────────────────────────────────────
+// NOTE: The client-side script is extracted as a plain string to avoid
+// nested backtick conflicts inside the outer HTML template literal.
+// This also restores correct VS Code syntax highlighting.
+const DASHBOARD_SCRIPT = [
+  'const API_BASE = window.location.origin',
+  '',
+  'function hideLoading() {',
+  '  const el = document.getElementById("loadingOverlay")',
+  '  if (el) el.classList.add("hidden")',
+  '}',
+  '',
+  'function toast(msg, type) {',
+  '  type = type || "info"',
+  '  const c = document.getElementById("toastContainer")',
+  '  const t = document.createElement("div")',
+  '  t.className = "toast align-items-center border-0 show"',
+  '  if (type === "danger") t.style.borderColor = "rgba(220,53,69,0.5)"',
+  '  else if (type === "warning") t.style.borderColor = "rgba(255,193,7,0.5)"',
+  '  else t.style.borderColor = "rgba(13,202,240,0.5)"',
+  '  t.role = "alert"',
+  '  t.innerHTML = \'<div class="d-flex"><div class="toast-body">\' + esc(String(msg)) + \'</div><button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button></div>\'',
+  '  c.appendChild(t)',
+  '  setTimeout(function() { t.remove() }, 3000)',
+  '}',
+  '',
+  'async function api(path, opts) {',
+  '  opts = opts || {}',
+  '  const resp = await fetch(API_BASE + path, Object.assign({ credentials: "include" }, opts))',
+  '  if (resp.status === 401) { window.location.reload(); throw new Error("Unauthorized") }',
+  '  return resp',
+  '}',
+  '',
+  'async function checkAuth() {',
+  '  try {',
+  '    const r = await fetch(API_BASE + "/api/auth/status", { credentials: "include" })',
+  '    const d = await r.json()',
+  '    if (d.authed) { hideLoading(); onLogin(); return }',
+  '    if (!d.passwordRequired) {',
+  '      const lr = await fetch(API_BASE + "/api/auth/login", {',
+  '        method: "POST", credentials: "include",',
+  '        headers: { "Content-Type": "application/json" },',
+  '        body: JSON.stringify({ password: "" })',
+  '      })',
+  '      const ld = await lr.json()',
+  '      if (ld.ok) { hideLoading(); onLogin(); return }',
+  '    }',
+  '  } catch(e) { /* fallback below */ }',
+  '  hideLoading()',
+  '  const loginEl = document.getElementById("loginOverlay")',
+  '  if (loginEl) loginEl.classList.remove("hidden")',
+  '}',
+  '',
+  '// Safety net: hide loading after 3s no matter what',
+  'setTimeout(hideLoading, 3000)',
+  '// Start auth check when DOM is ready',
+  'document.addEventListener("DOMContentLoaded", function() { checkAuth() })',
+  '',
+  'async function doLogin() {',
+  '  const pw = document.getElementById("loginPassword").value',
+  '  const r = await fetch(API_BASE + "/api/auth/login", {',
+  '    method: "POST", credentials: "include",',
+  '    headers: { "Content-Type": "application/json" },',
+  '    body: JSON.stringify({ password: pw })',
+  '  })',
+  '  const d = await r.json()',
+  '  if (d.ok) { onLogin(); return }',
+  '  document.getElementById("loginError").textContent = d.error || "登入失敗"',
+  '}',
+  '',
+  'async function doLogout() {',
+  '  await api("/api/auth/logout", { method: "POST" })',
+  '  window.location.reload()',
+  '}',
+  '',
+  'function onLogin() {',
+  '  document.getElementById("loginOverlay").classList.add("hidden")',
+  '  document.getElementById("navStatus").textContent = "已登入"',
+  '  document.getElementById("logoutBtn").style.display = ""',
+  '  loadDashboard()',
+  '}',
+  '',
+  'function switchPage(name) {',
+  '  document.querySelectorAll(".page").forEach(function(p) { p.classList.remove("active") })',
+  '  document.getElementById("page-" + name).classList.add("active")',
+  '  document.querySelectorAll(".sidebar .nav-link").forEach(function(l) { l.classList.remove("active") })',
+  '  const lnk = document.querySelector(".sidebar .nav-link[data-page=\\"" + name + "\\"]")',
+  '  if (lnk) lnk.classList.add("active")',
+  '  if (name === "provider") loadProvider()',
+  '  if (name === "settings") loadSettings()',
+  '  if (name === "playground") loadPlayground()',
+  '  if (name === "dashboard") loadDashboard()',
+  '}',
+  '',
+  'async function loadDashboard() {',
+  '  try {',
+  '    const results = await Promise.all([api("/api/provider"), api("/api/client-token")])',
+  '    const provider = await results[0].json()',
+  '    const tok = await results[1].json()',
+  '    var models = []',
+  '    try { models = provider && provider.models ? JSON.parse(provider.models) : [] } catch(e) {}',
+  '    document.getElementById("statProvider").textContent = provider && provider.base_url ? "已設定" : "未設定"',
+  '    document.getElementById("statModels").textContent = Array.isArray(models) ? models.length : 0',
+  '    document.getElementById("apiEndpoint").textContent = API_BASE + "/v1"',
+  '    var _t = tok.token || "sk-xxx"',
+  '    var _bs = String.fromCharCode(92)',
+  '    var _q = String.fromCharCode(39)',
+  '    var _curl = [',
+  '      "curl " + API_BASE + "/v1/chat/completions " + _bs,',
+  '      "  -H \\"Authorization: Bearer " + _t + "\\" " + _bs,',
+  '      "  -H \\"Content-Type: application/json\\" " + _bs,',
+  '      "  -d " + _q + JSON.stringify({model:"openai",messages:[{role:"user",content:"Hello"}]}) + _q',
+  '    ].join("\\n")',
+  '    document.getElementById("usageCode").textContent = _curl',
+  '  } catch(e) {}',
+  '}',
+  '',
+  'async function loadProvider() {',
+  '  try {',
+  '    const r = await api("/api/provider")',
+  '    const p = await r.json()',
+  '    document.getElementById("providerBaseUrl").value = (p && p.base_url) || "https://arko.arcaelas.com"',
+  '    document.getElementById("providerUpstreamModel").value = (p && p.upstream_model) || ""',
+  '    var models = ""',
+  '    try { models = p && p.models ? JSON.parse(p.models).join(", ") : "" } catch(e) {}',
+  '    document.getElementById("providerModels").value = models',
+'    document.getElementById("providerApiKey").value = (p && p.api_key) || ""',
+'    document.getElementById("providerApiKeyHint").textContent = (p && p.api_key_set) ? "✅ 已設定 API Key，修改後自動更新" : "⚠️ API Key 尚未設定（必填）"',
+  '  } catch(e) {}',
+  '}',
+  '',
+  'async function saveProvider() {',
+  '  var base_url = document.getElementById("providerBaseUrl").value.trim()',
+  '  var api_key = document.getElementById("providerApiKey").value',
+  '  var upstream_model = document.getElementById("providerUpstreamModel").value.trim()',
+  '  var modelsRaw = document.getElementById("providerModels").value.trim()',
+  '  var errEl = document.getElementById("providerFormError")',
+  '  base_url = base_url.replace(/\\/+$/, "") || "https://arko.arcaelas.com"',
+  '  document.getElementById("providerBaseUrl").value = base_url',
+  '  if (!base_url) { errEl.textContent = "請輸入 API 網址"; return }',
+  '  if (!upstream_model) { errEl.textContent = "請輸入 Agent ID (上游提供者)"; return }',
+  '  errEl.textContent = ""',
+  '  var models = modelsRaw ? modelsRaw.split(",").map(function(s) { return s.trim() }).filter(Boolean) : ["*"]',
+  '  var body = { base_url: base_url, upstream_model: upstream_model, models: models }',
+  '  if (api_key) body.api_key = api_key',
+  '  try {',
+  '    const r = await api("/api/provider", {',
+  '      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)',
+  '    })',
+  '    const d = await r.json()',
+  '    if (!r.ok) { errEl.textContent = d.error || "儲存失敗"; return }',
+  '    toast("已儲存", "success")',
+  '  } catch(e) { errEl.textContent = e.message || "儲存失敗" }',
+  '}',
+  '',
+  'async function testProvider() {',
+  '  try {',
+  '    const r = await api("/api/provider/test", { method: "POST" })',
+  '    const d = await r.json()',
+  '    if (d.ok) toast("連線成功 (" + d.status + ")", "success")',
+  '    else toast("連線失敗: " + (d.error || d.status || "未知錯誤"), "danger")',
+  '  } catch(e) { toast("測試失敗: " + e.message, "danger") }',
+  '}',
+  '',
+  'async function loadSettings() {',
+  '  const r = await api("/api/client-token")',
+  '  const d = await r.json()',
+  '  document.getElementById("clientTokenDisplay").textContent = d.token || "（無）"',
+  '  document.getElementById("passwordMsg").textContent = ""',
+  '  document.getElementById("tokenMsg").textContent = ""',
+  '}',
+  '',
+  'async function changePassword() {',
+  '  var pw = document.getElementById("newPassword").value',
+  '  document.getElementById("passwordMsg").textContent = "更新中..."',
+  '  try {',
+  '    const r = await api("/api/auth/password", {',
+  '      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: pw })',
+  '    })',
+  '    const d = await r.json()',
+  '    if (d.ok) document.getElementById("passwordMsg").innerHTML = \'<span class="text-success">密碼已更新</span>\'',
+  '    else document.getElementById("passwordMsg").innerHTML = \'<span class="text-danger">\' + (d.error || "失敗") + \'</span>\'',
+  '  } catch(e) { document.getElementById("passwordMsg").innerHTML = \'<span class="text-danger">更新失敗</span>\' }',
+  '}',
+  '',
+  'function copyText(id) {',
+  '  var el = document.getElementById(id)',
+  '  var text = el.textContent || el.innerText',
+  '  if (!text) return',
+  '  navigator.clipboard.writeText(text.trim()).then(function() { toast("已複製", "success") })',
+  '}',
+  '',
+  'function copyToken() {',
+  '  var t = document.getElementById("clientTokenDisplay").textContent',
+  '  if (!t || t === "（無）") return',
+  '  navigator.clipboard.writeText(t).then(function() { toast("已複製 Token", "success") })',
+  '}',
+  '',
+  'async function rotateToken() {',
+  '  if (!confirm("重新產生後，舊 Token 將立即失效，確定？")) return',
+  '  const r = await api("/api/client-token/rotate", { method: "POST" })',
+  '  const d = await r.json()',
+  '  if (d.token) {',
+  '    document.getElementById("clientTokenDisplay").textContent = d.token',
+  '    document.getElementById("tokenMsg").innerHTML = \'<span class="text-success">已重新產生</span>\'',
+  '    toast("Token 已更新", "success")',
+  '  }',
+  '}',
+  '',
+  'async function loadPlayground() {',
+  '  const r = await api("/api/models")',
+  '  const models = await r.json()',
+  '  const sel = document.getElementById("playgroundModel")',
+  '  sel.innerHTML = \'<option value="">-- 選擇模型 --</option>\'',
+  '  var seen = new Set()',
+  '  models.forEach(function(m) {',
+  '    if (seen.has(m.id)) return',
+  '    seen.add(m.id)',
+  '    sel.innerHTML += \'<option value="\' + esc(m.id) + \'">\' + esc(m.name || m.id) + \'</option>\'',
+  '  })',
+  '  if (models.length > 0) {',
+  '    sel.value = seen.has("openai") ? "openai" : models[0].id',
+  '  }',
+  '}',
+  '',
+  'function clearChat() {',
+  '  document.getElementById("chatBox").innerHTML = ""',
+  '  chatCid = ""',
+  '  if (abortController) { abortController.abort(); abortController = null }',
+  '}',
+'var abortController = null',
+'var chatCid = ""',
+'var lastSendTime = 0',
+'',
+'function buildConversationHistory() {',
+  '  var msgs = []',
+  '  var systemPrompt = document.getElementById("systemPrompt").value.trim()',
+  '  if (systemPrompt) msgs.push({ role: "system", content: systemPrompt })',
+  '  var bubbles = document.querySelectorAll("#chatBox .msg")',
+  '  bubbles.forEach(function(el) {',
+  '    var text = el.dataset.raw || el.textContent',
+  '    if (el.classList.contains("user")) msgs.push({ role: "user", content: text })',
+  '    if (el.classList.contains("assistant") && text.trim()) msgs.push({ role: "assistant", content: text })',
+  '  })',
+  '  return msgs',
+  '}',
+  '',
+'async function sendPlayground() {',
+'  var now = Date.now()',
+'  if (now - lastSendTime < 2000) { await new Promise(function(r) { setTimeout(r, 2000 - (now - lastSendTime)) }) }',
+'  var input = document.getElementById("userInput")',
+'  var msg = input.value.trim()',
+'  if (!msg) return',
+'  var model = document.getElementById("playgroundModel").value',
+'  if (!model) { toast("請選擇模型", "warning"); return }',
+  '  var temp = parseFloat(document.getElementById("temperature").value) || 0.7',
+  '  var maxTokens = parseInt(document.getElementById("maxTokens").value) || 2048',
+  '  var chatBox = document.getElementById("chatBox")',
+  '  var messages = buildConversationHistory()',
+  '  messages.push({ role: "user", content: msg })',
+  '  var umsg = document.createElement("div")',
+  '  umsg.className = "msg user"',
+  '  umsg.dataset.raw = msg',
+  '  umsg.textContent = msg',
+  '  chatBox.appendChild(umsg)',
+  '  input.value = ""',
+  '  input.style.height = "auto"',
+  '  chatBox.scrollTop = chatBox.scrollHeight',
+  '  var sendBtn = document.getElementById("playgroundSend")',
+  '  sendBtn.disabled = true',
+  '  sendBtn.textContent = "⏳ 思考中..."',
+  '  var msgEl = document.createElement("div")',
+  '  msgEl.className = "msg assistant"',
+  '  msgEl.innerHTML = \'<div class="typing-indicator"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div>\'',
+  '  chatBox.appendChild(msgEl)',
+  '  chatBox.scrollTop = chatBox.scrollHeight',
+  '  if (abortController) abortController.abort()',
+  '  abortController = new AbortController()',
+  '  try {',
+  '    var r = await fetch(API_BASE + "/api/playground/chat", {',
+  '      method: "POST", credentials: "include",',
+  '      headers: { "Content-Type": "application/json" },',
+  '      body: JSON.stringify({ model: model, messages: messages, stream: true, temperature: temp, max_tokens: maxTokens, cid: chatCid || undefined }),',
+  '      signal: abortController.signal',
+  '    })',
+  '    if (!r.ok) { var ej = await r.json(); throw new Error(ej.error || r.statusText) }',
+  '    var contentType = r.headers.get("Content-Type") || ""',
+  '    if (!contentType.includes("text/event-stream") && !contentType.includes("text/plain")) {',
+  '      var json = await r.json()',
+  '      var text = (json.choices && json.choices[0] && (json.choices[0].message && json.choices[0].message.content || json.choices[0].text)) || JSON.stringify(json)',
+'      msgEl.dataset.raw = text',
+'      msgEl.innerHTML = window.marked ? marked.parse(text) : esc(text)',
+'      if (window.hljs) enhanceCode(msgEl)',
+'      if (json._cid) chatCid = json._cid',
+'      sendBtn.disabled = false',
+'      sendBtn.textContent = "➤ 發送"',
+'      return',
+  '    }',
+  '    var reader = r.body.getReader()',
+  '    var decoder = new TextDecoder()',
+  '    var buffer = ""',
+  '    var fullText = ""',
+  '    var hasStarted = false',
+  '    while (true) {',
+  '      var chunk = await reader.read()',
+  '      if (chunk.done) break',
+  '      buffer += decoder.decode(chunk.value, { stream: true })',
+  '      var lines = buffer.split("\\n")',
+  '      buffer = lines.pop() || ""',
+  '      for (var i = 0; i < lines.length; i++) {',
+  '        var line = lines[i]',
+  '        if (!line.startsWith("data: ")) continue',
+  '        var data = line.slice(6)',
+  '        if (data === "[DONE]") continue',
+  '        try {',
+  '          var parsed = JSON.parse(data)',
+  '          var content = (parsed.choices && parsed.choices[0] && (parsed.choices[0].delta && parsed.choices[0].delta.content || parsed.choices[0].text)) || ""',
+  '          if (content) {',
+  '            if (!hasStarted) { hasStarted = true; msgEl.innerHTML = "" }',
+  '            fullText += content',
+  '            msgEl.dataset.raw = fullText',
+  '            msgEl.innerHTML = window.marked ? marked.parse(fullText) : esc(fullText)',
+  '          }',
+  '          if (parsed._cid) chatCid = parsed._cid',
+  '        } catch(e) {}',
+  '      }',
+  '      chatBox.scrollTop = chatBox.scrollHeight',
+  '    }',
+'  if (!fullText && !hasStarted) msgEl.textContent = "（無回應內容—請檢查伺服器日誌）"',
+'  if (fullText && window.hljs) enhanceCode(msgEl)',
+  '  } catch(e) {',
+  '    if (e.name !== "AbortError") {',
+  '      msgEl.className = "msg error"',
+  '      msgEl.textContent = "錯誤: " + e.message',
+  '    }',
+  '  }',
+'  sendBtn.disabled = false',
+'  sendBtn.textContent = "➤ 發送"',
+'  lastSendTime = Date.now()',
+'  chatBox.scrollTop = chatBox.scrollHeight',
+'}',
+  '',
+  'function esc(s) { if (!s) return ""; var d = document.createElement("div"); d.textContent = s; return d.innerHTML }',
+'',
+'function enhanceCode(container) {',
+'  container.querySelectorAll("pre code").forEach(function(el) {',
+'    var pre = el.parentElement',
+'    if (pre.parentElement.classList.contains("code-wrapper")) return',
+'    hljs.highlightElement(el)',
+'    var lang = (el.className.match(/language-(\w+)/) || [])[1] || ""',
+'    var wrapper = document.createElement("div")',
+'    wrapper.className = "code-wrapper"',
+'    var header = document.createElement("div")',
+'    header.className = "code-header"',
+'    if (lang) {',
+'      var langSpan = document.createElement("span")',
+'      langSpan.className = "code-lang"',
+'      langSpan.textContent = lang',
+'      header.appendChild(langSpan)',
+'    }',
+'    var btn = document.createElement("button")',
+'    btn.className = "copy-btn"',
+'    btn.textContent = "複製"',
+'    btn.onclick = function() {',
+'      var code = pre.textContent',
+'      navigator.clipboard.writeText(code).then(function() {',
+'        btn.textContent = "已複製!"',
+'        setTimeout(function() { btn.textContent = "複製" }, 2000)',
+'      })',
+'    }',
+'    header.appendChild(btn)',
+'    pre.parentElement.insertBefore(wrapper, pre)',
+'    wrapper.appendChild(header)',
+'    wrapper.appendChild(pre)',
+'  })',
+'}',
+'',
+'document.getElementById("temperature").addEventListener("input", function() { document.getElementById("tempVal").textContent = this.value })',
+'document.getElementById("userInput").addEventListener("input", function() { this.style.height = "auto"; this.style.height = Math.min(this.scrollHeight, 160) + "px" })',
+'document.getElementById("userInput").addEventListener("keydown", function(event) { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendPlayground() } })',
+].join('\n')
+
 function dashboardHtml(origin) {
   return `<!DOCTYPE html>
 <html lang="zh-TW" data-bs-theme="dark">
@@ -305,21 +685,41 @@ function dashboardHtml(origin) {
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Free Chat API Dashboard</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+<link href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"><\/script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"><\/script>
 <style>
-:root{--sidebar-width:220px}
-body{background:var(--bs-dark);min-height:100vh}
-#loadingOverlay{position:fixed;inset:0;z-index:99999;background:var(--bs-dark);display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
+:root{
+  --sidebar-width:240px;
+  --glass-bg: rgba(20, 20, 25, 0.7);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --accent: #0dcaf0;
+  --bg-gradient: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%);
+}
+body{font-family:'Inter',sans-serif;background:var(--bg-gradient);background-attachment:fixed;color:#f8f9fa;min-height:100vh}
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: rgba(0,0,0,0.1); }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.3); }
+#loadingOverlay{position:fixed;inset:0;z-index:99999;background:var(--bg-gradient);display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px;backdrop-filter:blur(10px)}
 #loadingOverlay.hidden{display:none}
-#loginOverlay{position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.85);display:flex;align-items:center;justify-content:center;backdrop-filter:blur(4px)}
+#loginOverlay{position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;backdrop-filter:blur(12px)}
 #loginOverlay.hidden{display:none}
-.sidebar{width:var(--sidebar-width);position:fixed;top:56px;left:0;bottom:0;background:var(--bs-dark);border-right:1px solid var(--bs-border-color);overflow-y:auto;z-index:100}
-.sidebar .nav-link{color:var(--bs-secondary-color);border-radius:0;padding:.65rem 1rem;cursor:pointer;border-left:3px solid transparent}
-.sidebar .nav-link:hover{color:var(--bs-light);background:var(--bs-tertiary-bg)}
-.sidebar .nav-link.active{color:var(--bs-info);border-left-color:var(--bs-info);background:rgba(13,202,240,.08)}
-.main{margin-left:var(--sidebar-width);padding:1.5rem;padding-top:76px;min-height:calc(100vh - 56px)}
+.card, .sidebar, .navbar { background: var(--glass-bg) !important; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border: 1px solid var(--glass-border) !important; }
+.sidebar{width:var(--sidebar-width);position:fixed;top:56px;left:0;bottom:0;overflow-y:auto;z-index:100;transition:transform 0.3s ease}
+.sidebar .nav-link{color:#adb5bd;border-radius:8px;margin:0.25rem 0.75rem;padding:.65rem 1rem;transition:all 0.2s ease}
+.sidebar .nav-link:hover{color:#fff;background:rgba(255,255,255,0.05);transform:translateX(4px)}
+.sidebar .nav-link.active{color:var(--accent);background:rgba(13,202,240,0.1);font-weight:500}
+.main{margin-left:var(--sidebar-width);padding:2rem;padding-top:80px;min-height:calc(100vh - 56px)}
+.card{border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,0.2);transition:transform 0.2s ease, box-shadow 0.2s ease}
+.card:hover{transform:translateY(-2px);box-shadow:0 12px 40px rgba(0,0,0,0.3)}
+.form-control, .form-select { background: rgba(0,0,0,0.2) !important; border: 1px solid var(--glass-border) !important; color: #fff !important; border-radius: 8px; }
+.form-control:focus, .form-select:focus { box-shadow: 0 0 0 0.25rem rgba(13,202,240,0.25); border-color: var(--accent) !important; }
 .page{display:none}
-.page.active{display:block}
-#page-playground.active{display:flex!important;flex-direction:column;height:calc(100vh - 56px - 76px - 24px)}
+.page.active{display:block;animation:fadeIn 0.4s ease}
+@keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+#page-playground.active{display:flex!important;flex-direction:column;height:calc(100vh - 56px - 80px - 24px)}
 #page-playground.active .row{flex:1;min-height:0;flex-wrap:nowrap!important}
 #page-playground.active .col-md-9{display:flex;flex-direction:column}
 #page-playground.active .chat-box{flex:1;min-height:0;overflow-y:auto;height:auto!important}
@@ -327,16 +727,30 @@ body{background:var(--bs-dark);min-height:100vh}
 #page-playground.active .input-group textarea{border-bottom-right-radius:0}
 #page-playground.active .input-group .btn{border-top-left-radius:0;border-bottom-left-radius:0;min-height:calc(1.5em + .75rem + 4px)}
 .welcome-section{text-align:center;padding:3rem 1rem}
-.welcome-section h1{font-size:2.5rem;margin-bottom:.5rem}
-.chat-box{overflow-y:auto;border:1px solid var(--bs-border-color);border-radius:var(--bs-border-radius);padding:1rem;background:var(--bs-tertiary-bg)}
-.chat-box .msg{margin-bottom:.75rem;padding:.5rem .75rem;border-radius:var(--bs-border-radius);max-width:85%}
-.chat-box .msg.user{background:var(--bs-info);color:var(--bs-dark);margin-left:auto}
-.chat-box .msg.assistant{background:var(--bs-secondary-bg);color:var(--bs-light)}
-.chat-box .msg.system{background:rgba(255,193,7,.15);color:var(--bs-warning);text-align:center;max-width:100%;font-size:.85rem}
-.chat-box .msg.error{background:rgba(220,53,69,.15);color:var(--bs-danger);text-align:center;max-width:100%}
-.token-display{font-family:monospace;background:var(--bs-tertiary-bg);padding:.5rem 1rem;border-radius:var(--bs-border-radius);word-break:break-all}
+.welcome-section h1{font-size:2.5rem;margin-bottom:.5rem;font-weight:600;background:linear-gradient(to right,#fff,#0dcaf0);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.chat-box{overflow-y:auto;border:1px solid var(--glass-border);border-radius:12px;padding:1.5rem;background:rgba(0,0,0,0.15);box-shadow:inset 0 2px 10px rgba(0,0,0,0.1)}
+.chat-box .msg{margin-bottom:1rem;padding:0.85rem 1.2rem;border-radius:12px;max-width:85%;animation:slideIn 0.3s cubic-bezier(0.16,1,0.3,1);line-height:1.6}
+@keyframes slideIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+.chat-box .msg.user{background:linear-gradient(135deg,#0dcaf0 0%,#087990 100%);color:#fff;margin-left:auto;border-bottom-right-radius:4px;box-shadow:0 4px 15px rgba(13,202,240,0.2)}
+.chat-box .msg.assistant{background:var(--glass-bg);color:#e2e8f0;border-bottom-left-radius:4px;border:1px solid var(--glass-border);box-shadow:0 4px 15px rgba(0,0,0,0.1)}
+.chat-box .msg.assistant p:last-child { margin-bottom: 0; }
+.chat-box .msg.assistant pre { background: rgba(0,0,0,0.3); border-radius: 8px; padding: 1rem; border: 1px solid var(--glass-border); overflow-x: auto; margin: 0; border-top-left-radius: 0; border-top-right-radius: 0; }
+.chat-box .msg.assistant .code-wrapper { margin-bottom: 1rem; border-radius: 8px; overflow: hidden; }
+.chat-box .msg.assistant .code-header { display: flex; justify-content: space-between; align-items: center; padding: 0.35rem 0.75rem; background: rgba(0,0,0,0.4); border: 1px solid var(--glass-border); border-bottom: none; border-radius: 8px 8px 0 0; }
+.chat-box .msg.assistant .code-lang { font-size: 0.75rem; color: #8b949e; text-transform: lowercase; }
+.chat-box .msg.assistant .copy-btn { font-size: 0.75rem; padding: 0.15rem 0.5rem; border-radius: 4px; border: 1px solid var(--glass-border); background: transparent; color: #8b949e; cursor: pointer; transition: all 0.2s; }
+.chat-box .msg.assistant .copy-btn:hover { background: rgba(255,255,255,0.1); color: #fff; }
+.chat-box .msg.system{background:rgba(255,193,7,.1);color:var(--bs-warning);text-align:center;max-width:100%;font-size:.85rem;border:1px solid rgba(255,193,7,.2)}
+.chat-box .msg.error{background:rgba(220,53,69,.1);color:#ff6b6b;text-align:center;max-width:100%;border:1px solid rgba(220,53,69,.2)}
+.token-display{font-family:monospace;background:rgba(0,0,0,0.2);padding:0.75rem 1rem;border-radius:8px;border:1px solid var(--glass-border);word-break:break-all}
 .toast-container{position:fixed;top:70px;right:1rem;z-index:99999}
-.form-label{font-size:.875rem;color:var(--bs-secondary-color)}
+.toast{background:var(--glass-bg)!important;backdrop-filter:blur(12px);border:1px solid var(--glass-border)!important;color:#fff!important}
+.form-label{font-size:.875rem;color:#adb5bd;font-weight:500}
+.typing-indicator{display:inline-flex;gap:4px;padding:4px 8px}
+.typing-dot{width:6px;height:6px;background:#adb5bd;border-radius:50%;animation:typing 1.4s infinite ease-in-out both}
+.typing-dot:nth-child(1){animation-delay:-0.32s}
+.typing-dot:nth-child(2){animation-delay:-0.16s}
+@keyframes typing{0%,80%,100%{transform:scale(0)}40%{transform:scale(1)}}
 </style>
 </head>
 <body>
@@ -414,10 +828,7 @@ body{background:var(--bs-dark);min-height:100vh}
         <span class="text-secondary small">使用方式</span>
         <button class="btn btn-sm btn-outline-secondary py-0" onclick="copyText('usageCode')">📋</button>
       </div>
-      <pre class="text-start bg-dark p-3 rounded border border-secondary" style="font-size:.85rem"><code id="usageCode">curl https://your-worker.workers.dev/v1/chat/completions \\
-  -H "Authorization: Bearer sk-xxx" \\
-  -H "Content-Type: application/json" \\
-  -d '{"model":"openai","messages":[{"role":"user","content":"Hello"}]}'</code></pre>
+      <pre class="text-start bg-dark p-3 rounded border border-secondary" style="font-size:.85rem"><code id="usageCode"></code></pre>
     </div>
   </div>
 </div>
@@ -435,7 +846,7 @@ body{background:var(--bs-dark);min-height:100vh}
           </div>
           <div class="col-md-6">
             <label class="form-label">API Key</label>
-            <input type="password" class="form-control" id="providerApiKey" placeholder="必填" autocomplete="new-password" required>
+            <input type="text" class="form-control" id="providerApiKey" placeholder="必填">
             <div class="form-text text-secondary" id="providerApiKeyHint">請輸入 API Key</div>
           </div>
           <div class="col-md-6">
@@ -444,7 +855,7 @@ body{background:var(--bs-dark);min-height:100vh}
             <div class="form-text text-secondary">對應 Arko Studio 的 Agent ID</div>
           </div>
           <div class="col-md-6">
-            <label class="form-label">模型（逗號分隔，預設 * = 全部）</label>
+            <label class="form-label">模型</label>
             <input type="text" class="form-control" id="providerModels" placeholder="*">
           </div>
         </div>
@@ -524,7 +935,7 @@ body{background:var(--bs-dark);min-height:100vh}
       </div>
       <div class="chat-box" id="chatBox"></div>
       <div class="input-group">
-        <textarea class="form-control" id="userInput" placeholder="輸入訊息... (Ctrl+Enter 發送)" rows="2" style="resize:none" onkeydown="if(event.key==='Enter'&&(event.ctrlKey||event.metaKey)){event.preventDefault();sendPlayground()}"></textarea>
+        <textarea class="form-control" id="userInput" placeholder="輸入訊息... (Enter 發送, Shift+Enter 換行)" rows="2" style="resize:none"></textarea>
         <button class="btn btn-info" id="playgroundSend" onclick="sendPlayground()">發送</button>
       </div>
     </div>
@@ -535,320 +946,7 @@ body{background:var(--bs-dark);min-height:100vh}
 
 <div class="toast-container" id="toastContainer"></div>
 
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" defer></script>
-<script>
-const API_BASE = window.location.origin
-
-function hideLoading() {
-  const el = document.getElementById('loadingOverlay')
-  if (el) el.classList.add('hidden')
-}
-
-function toast(msg, type='info') {
-  const c = document.getElementById('toastContainer')
-  const t = document.createElement('div')
-  t.className = 'toast align-items-center text-bg-' + type + ' border-0 show'
-  t.role = 'alert'
-  t.innerHTML = '<div class="d-flex"><div class="toast-body">' + esc(String(msg)) + '</div><button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button></div>'
-  c.appendChild(t)
-  setTimeout(() => { t.remove() }, 3000)
-}
-
-async function api(path, opts = {}) {
-  const resp = await fetch(API_BASE + path, { credentials: 'include', ...opts })
-  if (resp.status === 401) { window.location.reload(); throw new Error('Unauthorized') }
-  return resp
-}
-
-async function checkAuth() {
-  try {
-    const r = await fetch(API_BASE + '/api/auth/status', { credentials: 'include' })
-    const d = await r.json()
-    if (d.authed) { hideLoading(); onLogin(); return }
-    if (!d.passwordRequired) {
-      const lr = await fetch(API_BASE + '/api/auth/login', {
-        method: 'POST', credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: '' })
-      })
-      const ld = await lr.json()
-      if (ld.ok) { hideLoading(); onLogin(); return }
-    }
-  } catch { /* fallback below */ }
-  hideLoading()
-  const loginEl = document.getElementById('loginOverlay')
-  if (loginEl) loginEl.classList.remove('hidden')
-}
-
-// Safety net: hide loading after 3s no matter what
-setTimeout(hideLoading, 3000)
-// Start auth check when DOM is ready
-document.addEventListener('DOMContentLoaded', () => { checkAuth() })
-
-async function doLogin() {
-  const pw = document.getElementById('loginPassword').value
-  const r = await fetch(API_BASE + '/api/auth/login', {
-    method: 'POST', credentials: 'include',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ password: pw })
-  })
-  const d = await r.json()
-  if (d.ok) { onLogin(); return }
-  document.getElementById('loginError').textContent = d.error || '登入失敗'
-}
-
-async function doLogout() {
-  await api('/api/auth/logout', { method: 'POST' })
-  window.location.reload()
-}
-
-function onLogin() {
-  document.getElementById('loginOverlay').classList.add('hidden')
-  document.getElementById('navStatus').textContent = '已登入'
-  document.getElementById('logoutBtn').style.display = ''
-  loadDashboard()
-}
-
-function switchPage(name) {
-  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'))
-  document.getElementById('page-' + name).classList.add('active')
-  document.querySelectorAll('.sidebar .nav-link').forEach(l => l.classList.remove('active'))
-  document.querySelector('.sidebar .nav-link[data-page="' + name + '"]')?.classList.add('active')
-  if (name === 'provider') loadProvider()
-  if (name === 'settings') loadSettings()
-  if (name === 'playground') loadPlayground()
-  if (name === 'dashboard') loadDashboard()
-}
-
-async function loadDashboard() {
-  try {
-    const [pr, tk] = await Promise.all([
-      api('/api/provider'), api('/api/client-token')
-    ])
-    const provider = await pr.json()
-    const tok = await tk.json()
-    const models = provider?.models ? (() => { try { return JSON.parse(provider.models) } catch { return [] } })() : []
-    document.getElementById('statProvider').textContent = provider?.base_url ? '已設定' : '未設定'
-    document.getElementById('statModels').textContent = Array.isArray(models) ? models.length : 0
-    document.getElementById('apiEndpoint').textContent = API_BASE + '/v1'
-    var _t = (tok.token || 'sk-xxx')
-    var _curl = [
-      'curl ' + API_BASE + '/v1/chat/completions \\\\',
-      '  -H "Authorization: Bearer ' + _t + '" \\\\',
-      '  -H "Content-Type: application/json" \\\\',
-      "  -d '" + JSON.stringify({model: "openai", messages: [{role: "user", content: "Hello"}]}) + "'"
-    ].join('\\n')
-    document.getElementById('usageCode').textContent = _curl
-  } catch {}
-}
-
-async function loadProvider() {
-  try {
-    const r = await api('/api/provider')
-    const p = await r.json()
-    document.getElementById('providerBaseUrl').value = p?.base_url || 'https://arko.arcaelas.com'
-    document.getElementById('providerUpstreamModel').value = p?.upstream_model || ''
-    const models = p?.models ? (() => { try { return JSON.parse(p.models).join(', ') } catch { return '' } })() : ''
-    document.getElementById('providerModels').value = models
-    document.getElementById('providerApiKey').value = ''
-    document.getElementById('providerApiKeyHint').textContent = p?.api_key_set ? '✅ 已設定 API Key，留空則保留' : '⚠️ API Key 尚未設定（必填）'
-  } catch {}
-}
-
-async function saveProvider() {
-  let base_url = document.getElementById('providerBaseUrl').value.trim()
-  const api_key = document.getElementById('providerApiKey').value
-  const upstream_model = document.getElementById('providerUpstreamModel').value.trim()
-  const modelsRaw = document.getElementById('providerModels').value.trim()
-  const errEl = document.getElementById('providerFormError')
-  base_url = base_url.replace(/\\/+$/, '') || 'https://arko.arcaelas.com'
-  document.getElementById('providerBaseUrl').value = base_url
-  if (!base_url) { errEl.textContent = '請輸入 API 網址'; return }
-  if (!upstream_model) { errEl.textContent = '請輸入 Agent ID (上游提供者)'; return }
-  errEl.textContent = ''
-  const body = { base_url, upstream_model, models: modelsRaw ? modelsRaw.split(',').map(s => s.trim()).filter(Boolean) : ['*'] }
-  if (api_key) body.api_key = api_key
-  try {
-    const r = await api('/api/provider', {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
-    })
-    const d = await r.json()
-    if (!r.ok) { errEl.textContent = d.error || '儲存失敗'; return }
-    toast('已儲存', 'success')
-  } catch (e) { errEl.textContent = e.message || '儲存失敗' }
-}
-
-async function testProvider() {
-  try {
-    const r = await api('/api/provider/test', { method: 'POST' })
-    const d = await r.json()
-    if (d.ok) toast('連線成功 (' + d.status + ')', 'success')
-    else toast('連線失敗: ' + (d.error || d.status || '未知錯誤'), 'danger')
-  } catch (e) { toast('測試失敗: ' + e.message, 'danger') }
-}
-
-async function loadSettings() {
-  const r = await api('/api/client-token')
-  const d = await r.json()
-  document.getElementById('clientTokenDisplay').textContent = d.token || '（無）'
-  document.getElementById('passwordMsg').textContent = ''
-  document.getElementById('tokenMsg').textContent = ''
-}
-
-async function changePassword() {
-  const pw = document.getElementById('newPassword').value
-  document.getElementById('passwordMsg').textContent = '更新中...'
-  try {
-    const r = await api('/api/auth/password', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: pw })
-    })
-    const d = await r.json()
-    if (d.ok) document.getElementById('passwordMsg').innerHTML = '<span class="text-success">密碼已更新</span>'
-    else document.getElementById('passwordMsg').innerHTML = '<span class="text-danger">' + (d.error || '失敗') + '</span>'
-  } catch { document.getElementById('passwordMsg').innerHTML = '<span class="text-danger">更新失敗</span>' }
-}
-
-function copyText(id) {
-  const el = document.getElementById(id)
-  const text = el.textContent || el.innerText
-  if (!text) return
-  navigator.clipboard.writeText(text.trim()).then(() => toast('已複製', 'success'))
-}
-
-function copyToken() {
-  const t = document.getElementById('clientTokenDisplay').textContent
-  if (!t || t === '（無）') return
-  navigator.clipboard.writeText(t).then(() => toast('已複製 Token', 'success'))
-}
-
-async function rotateToken() {
-  if (!confirm('重新產生後，舊 Token 將立即失效，確定？')) return
-  const r = await api('/api/client-token/rotate', { method: 'POST' })
-  const d = await r.json()
-  if (d.token) {
-    document.getElementById('clientTokenDisplay').textContent = d.token
-    document.getElementById('tokenMsg').innerHTML = '<span class="text-success">已重新產生</span>'
-    toast('Token 已更新', 'success')
-  }
-}
-
-async function loadPlayground() {
-  const r = await api('/api/models')
-  const models = await r.json()
-  const sel = document.getElementById('playgroundModel')
-  sel.innerHTML = '<option value="">-- 選擇模型 --</option>'
-  const seen = new Set()
-  models.forEach(m => {
-    if (seen.has(m.id)) return
-    seen.add(m.id)
-    sel.innerHTML += '<option value="' + esc(m.id) + '">' + esc(m.id) + '</option>'
-  })
-  sel.value = 'openai'
-}
-
-function clearChat() {
-  document.getElementById('chatBox').innerHTML = ''
-  chatCid = ''
-  if (abortController) { abortController.abort(); abortController = null }
-}
-let abortController = null
-let chatCid = ''
-
-function buildConversationHistory() {
-  const msgs = []
-  const systemPrompt = document.getElementById('systemPrompt').value.trim()
-  if (systemPrompt) msgs.push({ role: 'system', content: systemPrompt })
-  const bubbles = document.querySelectorAll('#chatBox .msg')
-  bubbles.forEach(el => {
-    if (el.classList.contains('user')) msgs.push({ role: 'user', content: el.textContent })
-    if (el.classList.contains('assistant') && el.textContent.trim()) msgs.push({ role: 'assistant', content: el.textContent })
-  })
-  return msgs
-}
-
-async function sendPlayground() {
-  const input = document.getElementById('userInput')
-  const msg = input.value.trim()
-  if (!msg) return
-  const model = document.getElementById('playgroundModel').value
-  if (!model) { toast('請選擇模型', 'warning'); return }
-  const temp = parseFloat(document.getElementById('temperature').value) || 0.7
-  const maxTokens = parseInt(document.getElementById('maxTokens').value) || 2048
-  const chatBox = document.getElementById('chatBox')
-  const messages = buildConversationHistory()
-  messages.push({ role: 'user', content: msg })
-  chatBox.innerHTML += '<div class="msg user">' + esc(msg) + '</div>'
-  input.value = ''
-  input.style.height = 'auto'
-  chatBox.scrollTop = chatBox.scrollHeight
-  const sendBtn = document.getElementById('playgroundSend')
-  sendBtn.disabled = true
-  sendBtn.textContent = '⏳ 等待回應...'
-  const msgEl = document.createElement('div')
-  msgEl.className = 'msg assistant'
-  msgEl.textContent = '...'
-  chatBox.appendChild(msgEl)
-  chatBox.scrollTop = chatBox.scrollHeight
-  if (abortController) abortController.abort()
-  abortController = new AbortController()
-  try {
-    const r = await fetch(API_BASE + '/api/playground/chat', {
-      method: 'POST', credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, messages, stream: true, temperature: temp, max_tokens: maxTokens, cid: chatCid || undefined }),
-      signal: abortController.signal
-    })
-    if (!r.ok) { const e = await r.json(); throw new Error(e.error || r.statusText) }
-    const contentType = r.headers.get('Content-Type') || ''
-    if (!contentType.includes('text/event-stream') && !contentType.includes('text/plain')) {
-      const json = await r.json()
-      const text = json.choices?.[0]?.message?.content || json.choices?.[0]?.text || JSON.stringify(json)
-      msgEl.textContent = text
-      if (json._cid) chatCid = json._cid
-      sendBtn.disabled = false
-      sendBtn.textContent = '➤ 發送'
-      return
-    }
-    const reader = r.body.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ''
-    let fullText = ''
-    msgEl.textContent = ''
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      const lines = buffer.split('\\n')
-      buffer = lines.pop() || ''
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue
-        const data = line.slice(6)
-        if (data === '[DONE]') continue
-        try {
-          const parsed = JSON.parse(data)
-          const content = parsed.choices?.[0]?.delta?.content || parsed.choices?.[0]?.text || ''
-          if (content) { fullText += content; msgEl.textContent = fullText }
-          if (parsed._cid) chatCid = parsed._cid
-        } catch {}
-      }
-      chatBox.scrollTop = chatBox.scrollHeight
-    }
-    if (!fullText) msgEl.textContent = '（無回應內容—請檢查伺服器日誌）'
-  } catch (e) {
-    if (e.name !== 'AbortError') {
-      msgEl.className = 'msg error'
-      msgEl.textContent = '錯誤: ' + e.message
-    }
-  }
-  sendBtn.disabled = false
-  sendBtn.textContent = '➤ 發送'
-  chatBox.scrollTop = chatBox.scrollHeight
-}
-
-function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML }
-
-document.getElementById('temperature').addEventListener('input', function() { document.getElementById('tempVal').textContent = this.value })
-document.getElementById('userInput').addEventListener('input', function() { this.style.height = 'auto'; this.style.height = Math.min(this.scrollHeight, 160) + 'px' })
-</script>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" defer><\/script>
+<script>${DASHBOARD_SCRIPT}<\/script>
 </body></html>`
 }

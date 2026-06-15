@@ -86,6 +86,9 @@ export async function initDB(db) {
 
   // Clean expired sessions
   await db.prepare("DELETE FROM sessions WHERE expires_at < datetime('now')").run()
+  
+  // Clean old chat_cids
+  await db.prepare("DELETE FROM chat_cids WHERE updated_at < datetime('now', '-7 days')").run()
 }
 
 // ── Session ───────────────────────────────────────────────────────
@@ -133,8 +136,7 @@ export async function setDashboardPasswordHash(db, hash) {
 // Provider config (flattened into config table — single arko provider)
 export function sanitizeProvider(p) {
   if (!p) return p
-  const { api_key, ...rest } = p
-  return { ...rest, api_key_set: !!(api_key && api_key.length) }
+  return { ...p, api_key_set: !!(p.api_key && p.api_key.length) }
 }
 
 export async function getProvider(db) {
@@ -526,11 +528,22 @@ export async function readArkoStream(response) {
   const reader = response.body?.getReader()
   if (!reader) return { content: '' }
   const decoder = new TextDecoder()
+  let buffer = ''
   while (true) {
     const { done, value } = await reader.read()
-    if (done) break
-    const chunk = decoder.decode(value, { stream: true })
-    for (const line of chunk.split('\n').filter(Boolean)) {
+    if (done) {
+      if (buffer) {
+        try {
+          const json = JSON.parse(buffer)
+          if (json.type === 'delta' && json.content) full += json.content
+        } catch {}
+      }
+      break
+    }
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split('\n')
+    buffer = lines.pop() || ''
+    for (const line of lines.filter(Boolean)) {
       try {
         const json = JSON.parse(line)
         if (json.type === 'chat' && json.id) chatId = json.id
@@ -600,6 +613,7 @@ function openAICompletion(model, text, toolCall, cid) {
 
 // ── Core proxy ────────────────────────────────────────────────────
 const sleep = (ms) => new Promise(r => setTimeout(r, ms))
+const lastArkoCall = new Map()
 
 export async function proxyArko(provider, payload, stream, db) {
   const messages = payload.messages || []
@@ -619,7 +633,9 @@ export async function proxyArko(provider, payload, stream, db) {
 
   // Tool intent detection
   const lastUser = [...messages].reverse().find(m => m.role === 'user')
+  const systemMsg = messages.find(m => m.role === 'system')
   const baseContent = lastUser?.content || ''
+  const contentWithSystem = systemMsg ? `[System Instructions]\n${systemMsg.content}\n\n${baseContent}` : baseContent
 
   // Build tool descriptions (shared between tool and non-tool paths)
   let toolDesc = ''
@@ -707,6 +723,7 @@ export async function proxyArko(provider, payload, stream, db) {
   if (toolsActive && userIntendsTool(baseContent, tools)) {
     // Phase 1: Ask arko (aware + extract combined)
     if (toolDesc) {
+      const recentHistory = messages.slice(-5).map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n')
       const ep = `You are a parameter extraction assistant. Extract the tool call parameters from the user's request.\n\n` +
         `Available tools:\n${toolDesc}\n\n` +
         `Rules:\n` +
@@ -716,7 +733,7 @@ export async function proxyArko(provider, payload, stream, db) {
         `- If user provided a URL, include it exactly as given\n` +
         `- If a parameter is not mentioned in the request, guess a reasonable value\n` +
         `- If the user's intent does NOT match any tool, respond normally as a helpful assistant\n\n` +
-        `User: ${baseContent}`
+        `Conversation History:\n${recentHistory}\n\nExtract parameters for the final User request.`
       try {
         const resp = await callArko({ content: ep, stream: true, aid }, 8000)
         const parsed = await readArkoStream(resp)
@@ -779,10 +796,15 @@ export async function proxyArko(provider, payload, stream, db) {
 
   for (let attempt = 0; attempt < 2; attempt++) {
     if (attempt > 0) await sleep(500)
-    const useCid = attempt === 0 && resolvedCid
-    const body = { content: baseContent, stream: true, ...(useCid ? { cid: resolvedCid } : { aid }) }
+    // Per-agent throttle: at least 2s between calls to the same agent
+    const now = Date.now()
+    const lastTime = lastArkoCall.get(aid) || 0
+    if (now - lastTime < 2000) await sleep(2000 - (now - lastTime))
+    lastArkoCall.set(aid, Date.now())
+    const body = { content: contentWithSystem, stream: true, aid, ...(attempt === 0 && resolvedCid ? { cid: resolvedCid } : {}) }
     try {
       const resp = await callArko(body, 8000)
+      
       const parsed = await readArkoStream(resp)
       if (parsed.content) {
         // Save cid keyed by all user messages (stable for next turn)
@@ -799,7 +821,16 @@ export async function proxyArko(provider, payload, stream, db) {
         }
         return returnText(parsed.content, parsed.chatId)
       }
-    } catch (e) { if (attempt >= 1) throw e }
+    } catch (e) {
+      if (attempt === 0 && resolvedCid && db) {
+        try {
+          await db.prepare('DELETE FROM chat_cids WHERE cid = ?').bind(resolvedCid).run()
+        } catch (dbErr) {
+          console.error('Failed to clean up invalid cid from D1:', dbErr)
+        }
+      }
+      if (attempt >= 1) throw e
+    }
   }
   throw new Error('Arko returned empty content after retries')
 }
@@ -844,7 +875,7 @@ export async function listAgents(provider) {
   } catch { return [] }
 }
 
-export async function cleanupOldChats(provider, aid, knownAgents) {
+export async function cleanupOldChats(provider, aid, knownAgents, db) {
   if (!provider?.api_key) return { cleaned: false, error: 'No API key configured', deleted: 0, agents: 0 }
 
   const root = provider.base_url.replace(/\/+$/, '').replace(/\/v3(\/.*)?$/, '')
@@ -870,9 +901,10 @@ export async function cleanupOldChats(provider, aid, knownAgents) {
   if (!agentIds.length) return { cleaned: true, checked: 0, deleted: 0, agents: 0 }
   const agentSet = new Set(agentIds)
 
-  const today = new Date()
-  today.setHours(0, 0, 0, 0)
-  const todayStr = today.toISOString()
+  // Cutoff is 7 days ago, checking updated_at to protect active sessions
+  const retentionDays = 7
+  const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000)
+  const cutoffStr = cutoff.toISOString()
 
   let totalDeleted = 0
   let totalChecked = 0
@@ -901,7 +933,8 @@ export async function cleanupOldChats(provider, aid, knownAgents) {
       totalChecked++
       if (totalDeleted >= MAX_DELETIONS) break
       if (!agentSet.has(chat.agent?.id)) continue
-      if (chat.created_at && chat.created_at >= todayStr) continue
+      // Keep chats updated within the retention window
+      if (chat.updated_at && chat.updated_at >= cutoffStr) continue
       toDelete.push(chat.id)
     }
 
@@ -910,11 +943,18 @@ export async function cleanupOldChats(provider, aid, knownAgents) {
       const batchSize = 5
       for (let i = 0; i < toDelete.length && totalDeleted < MAX_DELETIONS; i += batchSize) {
         const batch = toDelete.slice(i, i + batchSize)
-        const results = await Promise.allSettled(batch.map(id =>
-          fetch(`${root}/v3/chats/${encodeURIComponent(id)}`, { method: 'DELETE', headers })
-        ))
+        const results = await Promise.allSettled(batch.map(async (id) => {
+          const r = await fetch(`${root}/v3/chats/${encodeURIComponent(id)}`, { method: 'DELETE', headers })
+          if (r.ok || r.status === 204 || r.status === 404) {
+            if (db) {
+              await db.prepare('DELETE FROM chat_cids WHERE cid = ?').bind(id).run().catch(e => console.error('Failed to delete cid from D1:', e))
+            }
+            return true
+          }
+          return false
+        }))
         for (const r of results) {
-          if (r.status === 'fulfilled' && (r.value.ok || r.value.status === 204)) totalDeleted++
+          if (r.status === 'fulfilled' && r.value) totalDeleted++
         }
       }
     }
