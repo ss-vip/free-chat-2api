@@ -553,17 +553,14 @@ export async function readArkoStream(response) {
 }
 
 // ── CID save helper ───────────────────────────────────────────
-async function saveChatCid(db, allUserMsgs, chatId, currentAid) {
-  const hashStr = JSON.stringify(allUserMsgs)
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(hashStr))
-  const newHash = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 64)
+async function saveChatCid(db, ctxHash, chatId, currentAid) {
   await db.prepare(
     'INSERT OR REPLACE INTO chat_cids (ctx_hash, cid, aid, updated_at) VALUES (?, ?, ?, datetime(\'now\'))'
-  ).bind(newHash, chatId, currentAid).run()
+  ).bind(ctxHash, chatId, currentAid).run()
 }
 
 // ── True streaming: NDJSON → SSE (per-token) ───────────────────
-function streamArkoToSSE(response, model, sid, cid, db, allUserMsgs, currentAid) {
+function streamArkoToSSE(response, model, sid, cid, db, allUserMsgs, currentAid, ctxHash) {
   const enc = new TextEncoder()
   const { readable, writable } = new TransformStream()
   const writer = writable.getWriter()
@@ -573,7 +570,9 @@ function streamArkoToSSE(response, model, sid, cid, db, allUserMsgs, currentAid)
       const ct = response.headers.get('content-type') || ''
       if (ct.includes('application/json')) {
         const obj = await response.json()
-        const content = obj.content || obj.text || JSON.stringify(obj)
+        const parsed = parseArkoJSON(obj)
+        const content = parsed?.content || obj.content || obj.text || JSON.stringify(obj)
+        chatId = parsed?.chatId || ''
         if (content) {
           for (const chunk of [
             { choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] },
@@ -596,7 +595,7 @@ function streamArkoToSSE(response, model, sid, cid, db, allUserMsgs, currentAid)
       const decoder = new TextDecoder()
       let buffer = ''
       let chatId = ''
-      let hasContent = false
+      let fullContent = ''
 
       while (true) {
         const { done, value } = await reader.read()
@@ -605,19 +604,18 @@ function streamArkoToSSE(response, model, sid, cid, db, allUserMsgs, currentAid)
             try {
               const json = JSON.parse(buffer)
               if (json.type === 'delta' && json.content) {
-                hasContent = true
+                fullContent += json.content
                 await writer.write(enc.encode('data: ' + JSON.stringify({
                   id: sid, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
                   model, choices: [{ index: 0, delta: { content: json.content }, finish_reason: null }],
                   _cid: cid || chatId
                 }) + '\n\n'))
               } else if (json.type === 'error') {
-                // Arko stream error — forward to client
                 await writer.write(enc.encode('data: ' + JSON.stringify({
                   id: sid, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
                   model, choices: [{ index: 0, delta: { content: '[Arko 錯誤: ' + (json.message || json.code || 'unknown') + ']' }, finish_reason: null }]
                 }) + '\n\n'))
-                hasContent = true
+                if (!fullContent) fullContent = ''
               }
             } catch {}
           }
@@ -632,26 +630,36 @@ function streamArkoToSSE(response, model, sid, cid, db, allUserMsgs, currentAid)
             if (json.type === 'chat' && json.id) {
               chatId = json.id
             } else if (json.type === 'delta' && json.content) {
-              hasContent = true
+              fullContent += json.content
               await writer.write(enc.encode('data: ' + JSON.stringify({
                 id: sid, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
                 model, choices: [{ index: 0, delta: { content: json.content }, finish_reason: null }],
                 _cid: cid || chatId
               }) + '\n\n'))
             } else if (json.type === 'error') {
-              // Arko error — write into SSE stream instead of silent ignore
               await writer.write(enc.encode('data: ' + JSON.stringify({
                 id: sid, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
                 model, choices: [{ index: 0, delta: { content: '[Arko 錯誤: ' + (json.message || json.code || 'unknown') + ']' }, finish_reason: null }],
                 ...(cid || chatId ? { _cid: cid || chatId } : {})
               }) + '\n\n'))
-              hasContent = true
+              if (!fullContent) fullContent = ''
             } else if (json.type === 'done') {
-              // Extract assistant content from done.messages if no deltas received
-              if (!hasContent && Array.isArray(json.messages)) {
+              // Always use complete assistant content from done.messages
+              // (deltas may be partial due to tool_call interruptions)
+              if (Array.isArray(json.messages)) {
                 const lastAssistant = [...json.messages].reverse().find(m => m.role === 'assistant' && m.content)
-                if (lastAssistant?.content) {
-                  hasContent = true
+                if (lastAssistant?.content && lastAssistant.content.length > fullContent.length) {
+                  const remaining = lastAssistant.content.slice(fullContent.length)
+                  if (remaining) {
+                    fullContent = lastAssistant.content
+                    await writer.write(enc.encode('data: ' + JSON.stringify({
+                      id: sid, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
+                      model, choices: [{ index: 0, delta: { content: remaining }, finish_reason: null }],
+                      _cid: cid || chatId
+                    }) + '\n\n'))
+                  }
+                } else if (lastAssistant?.content && !fullContent) {
+                  fullContent = lastAssistant.content
                   await writer.write(enc.encode('data: ' + JSON.stringify({
                     id: sid, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
                     model, choices: [{ index: 0, delta: { content: lastAssistant.content }, finish_reason: null }],
@@ -659,8 +667,8 @@ function streamArkoToSSE(response, model, sid, cid, db, allUserMsgs, currentAid)
                   }) + '\n\n'))
                 }
               }
-              if (chatId && db && allUserMsgs?.length) {
-                saveChatCid(db, allUserMsgs, chatId, currentAid).catch(() => {})
+              if (chatId && db && ctxHash) {
+                try { await saveChatCid(db, ctxHash, chatId, currentAid) } catch {}
               }
               const finalCid = cid || chatId
               await writer.write(enc.encode('data: ' + JSON.stringify({
@@ -676,7 +684,7 @@ function streamArkoToSSE(response, model, sid, cid, db, allUserMsgs, currentAid)
       }
 
       // Stream ended without done event — still close cleanly
-      if (!hasContent) throw new Error('Empty stream')
+      if (!fullContent) throw new Error('Empty stream')
       await writer.write(enc.encode('data: [DONE]\n\n'))
     } catch (e) {
       try {
@@ -897,11 +905,12 @@ export async function proxyArko(provider, payload, stream, db) {
             }
           return returnToolCall(tc, parsed.chatId)
         }
-      } catch {}
+      } catch (e) { console.error('Tool extraction failed:', e) }
     }
     // Phase 2: Metadata extraction fallback
     const tc = generateMockToolCall(tools, baseContent)
     if (tc) return returnToolCall(tc, payload.cid)
+    return returnText('[無法解析工具請求，請重新描述]', payload.cid)
   }
 
   // Tool awareness questions
@@ -913,38 +922,41 @@ export async function proxyArko(provider, payload, stream, db) {
   const aids = aid.split(',').map(s => s.trim()).filter(Boolean)
   const allUserMsgs = messages.filter(m => m.role === 'user').map(m => m.content)
 
-  // Determine AID order: if existing CID found, pin to that AID; otherwise rotate
+  // Compute saveHash from ALL user messages (for saving CID at end of this turn)
+  // Compute lookupHash from PREVIOUS user messages (for finding existing CID)
   let aidOrder, ctxHash
   const prevMsgs = allUserMsgs.slice(0, allUserMsgs.length - (messages[messages.length - 1]?.role === 'user' ? 1 : 0))
-  if (db && prevMsgs.length) {
-    const hashStr = JSON.stringify(prevMsgs)
+  if (db && allUserMsgs.length) {
+    const hashStr = JSON.stringify(allUserMsgs)
     const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(hashStr))
     ctxHash = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 64)
-    // Find which AID has an existing CID for this conversation
+  }
+  if (db && prevMsgs.length) {
+    const hashStr2 = JSON.stringify(prevMsgs)
+    const buf2 = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(hashStr2))
+    const lookupHash = Array.from(new Uint8Array(buf2)).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 64)
     const existing = await db.prepare(
       'SELECT aid FROM chat_cids WHERE ctx_hash = ? AND aid IN (' + aids.map(() => '?').join(',') + ') LIMIT 1'
-    ).bind(ctxHash, ...aids).first()
+    ).bind(lookupHash, ...aids).first()
     if (existing?.aid) {
-      // Pin to the AID that has context; remaining AIDs as fallback in original order
       aidOrder = [existing.aid, ...aids.filter(a => a !== existing.aid)]
     }
   }
   if (!aidOrder) {
     // New conversation: rotate start AID for load balancing
     const offset = (aidRotateCounter++) % aids.length
+    if (aidRotateCounter > 1000000) aidRotateCounter = aids.length
     aidOrder = [...aids.slice(offset), ...aids.slice(0, offset)]
   }
 
   let lastErr = null
   for (let cycle = 0; cycle < 3; cycle++) {
     for (const currentAid of aidOrder) {
-      // Per-agent throttle: at least 1s between calls to the same agent
       const now = Date.now()
       const lastTime = lastArkoCall.get(currentAid) || 0
       if (now - lastTime < 1000) await sleep(1000 - (now - lastTime))
       lastArkoCall.set(currentAid, Date.now())
 
-      // Resolve cid for this specific AID
       let resolvedCid = payload.cid || null
       if (!resolvedCid && db && prevMsgs.length && ctxHash) {
         const row = await db.prepare('SELECT cid FROM chat_cids WHERE ctx_hash = ? AND aid = ?').bind(ctxHash, currentAid).first()
@@ -955,27 +967,26 @@ export async function proxyArko(provider, payload, stream, db) {
       try {
         const resp = await callArko(body, 8000)
 
-        // ── True streaming path (per-token) ──
         if (stream) {
           const sid = makeCompletionId()
-          return streamArkoToSSE(resp, model, sid, payload.cid, db, allUserMsgs, currentAid)
+          return streamArkoToSSE(resp, model, sid, payload.cid, db, allUserMsgs, currentAid, ctxHash)
         }
 
-        // ── Non-streaming path ──
         const parsed = await readArkoStream(resp)
         if (parsed.content) {
-          // Save cid keyed by all user messages (stable for next turn)
-          if (db && parsed.chatId && messages?.length && allUserMsgs.length) {
-            saveChatCid(db, allUserMsgs, parsed.chatId, currentAid).catch(() => {})
+          if (db && parsed.chatId && ctxHash) {
+            try { await saveChatCid(db, ctxHash, parsed.chatId, currentAid) } catch {}
           }
           return openAICompletion(model, parsed.content, null, parsed.chatId)
         }
-        // empty content → fall through
       } catch (e) {
         lastErr = e
+        const status = e.message?.match(/Arko HTTP (\d+)/)?.[1] || 'unknown'
+        console.error(`Arko attempt failed (aid=${currentAid.slice(0,8)} status=${status} cycle=${cycle + 1}):`, e.message?.slice(0, 200))
       }
 
-      await sleep(500) // delay before next attempt
+      const backoff = [500, 1000, 2000][Math.min(cycle, 2)]
+      await sleep(backoff)
     }
   }
   throw new Error('Arko returned empty content after retries' + (lastErr ? ': ' + lastErr.message : ''))
@@ -1016,7 +1027,7 @@ export async function listAgents(provider, maxLimit = 200) {
       if (!resp.ok) break
       const body = await resp.json()
       const rows = body?.data?.rows || []
-      const total = body?.data?.total || 0
+      const total = body?.data?.count || 0
       allRows.push(...rows)
       offset += pageSize
       if (allRows.length >= total || rows.length < pageSize) break
@@ -1051,9 +1062,8 @@ export async function cleanupOldChats(provider, aid, knownAgents, db) {
   if (!agentIds.length) return { cleaned: true, checked: 0, deleted: 0, agents: 0 }
   const agentSet = new Set(agentIds)
 
-  // Cutoff is start of today; any chat with updated_at before today gets deleted
-  const cutoff = new Date()
-  cutoff.setHours(0, 0, 0, 0)
+  const retentionDays = 1
+  const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000)
   const cutoffStr = cutoff.toISOString()
 
   let totalDeleted = 0
