@@ -4,8 +4,7 @@ import {
   initDB, getClientToken, rotateClientToken,
   getDashboardPasswordHash, setDashboardPasswordHash,
   getProvider, updateProvider, sanitizeProvider,
-  proxyArko, testProviderConnection, cleanupOldChats, listAgents,
-  proxyArkoViaWS,
+  proxyArko, proxyArkoSSE, testProviderConnection, cleanupOldChats, listAgents,
   createSession, getValidSession, deleteSession, deleteExpiredSessions
 } from './lib/db.js'
 import {
@@ -173,9 +172,9 @@ app.post('/api/playground/chat', async (c) => {
   const stream = rest.stream !== false
   const payload = { model, messages, stream, ...rest }
   try {
-    const result = await proxyArko(provider, payload, stream, c.env.DB)
-    if (result instanceof Response) return result
-    return c.json(result)
+    if (stream) return await proxyArkoSSE(provider, payload, c.env.DB)
+    const result = await proxyArko(provider, payload, false, c.env.DB)
+    return result instanceof Response ? result : c.json(result)
   } catch (e) {
     return c.json({ error: e.message }, 502)
   }
@@ -203,58 +202,23 @@ app.post('/v1/chat/completions', async (c) => {
   const token = auth.replace('Bearer ', '')
   const stored = await getClientToken(c.env.DB)
   if (!stored || token !== stored) return c.json({ error: 'Unauthorized' }, 401)
-  const body = await c.req.json()
+  let body
+  try { body = await c.req.json() } catch (e) {
+    const raw = await c.req.text().catch(() => '')
+    return c.json({ error: 'Invalid JSON body: ' + (raw ? raw.slice(0, 200) : 'empty') }, 400)
+  }
   const { model, messages, ...rest } = body
   const provider = await getProvider(c.env.DB)
   if (!provider) return c.json({ error: 'No provider configured' }, 503)
   const stream = rest.stream !== false
   const payload = { model, messages, stream, ...rest }
   try {
-    const result = await proxyArko(provider, payload, stream, c.env.DB)
-    if (result instanceof Response) return result
-    return c.json(result)
+    if (stream) return await proxyArkoSSE(provider, payload, c.env.DB)
+    const result = await proxyArko(provider, payload, false, c.env.DB)
+    return result instanceof Response ? result : c.json(result)
   } catch (e) {
     return c.json({ error: e.message }, 502)
   }
-})
-
-// ---- WebSocket for long-running operations ----
-app.get('/ws', async (c) => {
-  const upgrade = c.req.header('Upgrade')
-  if (upgrade?.toLowerCase() !== 'websocket') return c.text('Expected WebSocket upgrade', 426)
-
-  const [client, server] = Object.values(new WebSocketPair())
-  server.accept()
-
-  // Auth via query param
-  const queryToken = c.req.query('token')
-
-  server.addEventListener('message', async (event) => {
-    let payload
-    try { payload = JSON.parse(event.data) } catch {
-      server.send(JSON.stringify({ type: 'error', message: 'Invalid JSON' }))
-      server.close(); return
-    }
-
-    const stored = await getClientToken(c.env.DB)
-    const token = queryToken || payload.token || c.req.header('Authorization')?.replace('Bearer ', '')
-    if (stored && token !== stored) {
-      server.send(JSON.stringify({ type: 'error', message: 'Unauthorized' }))
-      server.close(); return
-    }
-
-    try {
-      const provider = await getProvider(c.env.DB)
-      if (!provider) throw new Error('No provider configured')
-      await proxyArkoViaWS(provider, payload, server, c.env.DB)
-    } catch (e) {
-      server.send(JSON.stringify({ type: 'error', message: e.message }))
-    } finally {
-      server.close(1000, 'complete')
-    }
-  })
-
-  return new Response(null, { status: 101, webSocket: client })
 })
 
 // ---- Debug ----
@@ -301,7 +265,7 @@ app.get('/health', async (c) => {
       status: 'active'
     }))
 
-    // Cleanup old chats for all discovered agents (skip rediscovery)
+    // Cleanup old chats
     let cleanup = null
     try {
       cleanup = await cleanupOldChats(provider, '', agents.map(a => a.id), c.env.DB)
@@ -332,7 +296,11 @@ app.onError((err, c) => {
 
 app.all('*', (c) => c.text('Not Found', 404))
 
-export default app
+export default {
+  async fetch(request, env, ctx) {
+    return app.fetch(request, env, ctx)
+  }
+}
 
 // ── HTML template ─────────────────────────────────────────────────
 // NOTE: The client-side script is extracted as a plain string to avoid

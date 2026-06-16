@@ -771,8 +771,18 @@ export async function proxyArko(provider, payload, stream, db, wsTimeoutMs) {
   // Tool intent detection
   const lastUser = [...messages].reverse().find(m => m.role === 'user')
   const systemMsg = messages.find(m => m.role === 'system')
-  const baseContent = lastUser?.content || ''
-  const contentWithSystem = systemMsg ? `[System Instructions]\n${systemMsg.content}\n\n${baseContent}` : baseContent
+
+  // Normalize content: array → extract text parts (handle vision/image payloads)
+  const normalizeContent = (c) => {
+    if (!c) return ''
+    if (typeof c === 'string') return c
+    if (Array.isArray(c)) return c.filter(p => p.type === 'text').map(p => p.text || '').join(' ')
+    return String(c)
+  }
+
+  const baseContent = normalizeContent(lastUser?.content)
+  const sysContent = normalizeContent(systemMsg?.content)
+  const contentWithSystem = sysContent ? `[System Instructions]\n${sysContent}\n\n${baseContent}` : baseContent
 
   // Build tool descriptions (shared between tool and non-tool paths)
   let toolDesc = ''
@@ -785,6 +795,11 @@ export async function proxyArko(provider, payload, stream, db, wsTimeoutMs) {
         : ''
       return `- ${d.name}${d.description ? ': ' + d.description : ''}\n${params}`
     }).filter(Boolean).join('\n')
+  }
+
+  // Validate non-empty message content before calling Arko API
+  if (!contentWithSystem?.trim() && !toolsActive) {
+    throw new Error('Message content is empty — provide a user message')
   }
 
   // Shared arko helpers
@@ -920,7 +935,7 @@ export async function proxyArko(provider, payload, stream, db, wsTimeoutMs) {
 
   // Non-tool path: plain text to arko
   const aids = aid.split(',').map(s => s.trim()).filter(Boolean)
-  const allUserMsgs = messages.filter(m => m.role === 'user').map(m => m.content)
+  const allUserMsgs = messages.filter(m => m.role === 'user').map(m => normalizeContent(m.content))
 
   // Compute saveHash from ALL user messages (for saving CID at end of this turn)
   // Compute lookupHash from PREVIOUS user messages (for finding existing CID)
@@ -1042,25 +1057,7 @@ export async function cleanupOldChats(provider, aid, knownAgents, db) {
   const root = provider.base_url.replace(/\/+$/, '').replace(/\/v3(\/.*)?$/, '')
   const headers = {
     'Authorization': 'Bearer ' + provider.api_key,
-    'Content-Type': 'application/json'
   }
-
-  // Determine target agents: use knownAgents if provided, otherwise discover
-  let agentIds = []
-  if (knownAgents?.length) {
-    agentIds = knownAgents
-  } else if (aid) {
-    agentIds = [aid]
-  } else {
-    const resp = await fetch(`${root}/v3/agents?limit=100`, { headers })
-    if (!resp.ok) return { cleaned: false, error: `List agents HTTP ${resp.status}`, deleted: 0, agents: 0 }
-    const body = await resp.json()
-    if (!body?.success) return { cleaned: false, error: body?.message || 'Arko list agents failed', deleted: 0, agents: 0 }
-    agentIds = (body.data?.rows || []).map(a => a.id).filter(Boolean)
-  }
-
-  if (!agentIds.length) return { cleaned: true, checked: 0, deleted: 0, agents: 0 }
-  const agentSet = new Set(agentIds)
 
   const retentionDays = 1
   const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000)
@@ -1070,19 +1067,19 @@ export async function cleanupOldChats(provider, aid, knownAgents, db) {
   let totalChecked = 0
   let offset = 0
   let pages = 0
-  const MAX_PAGES = 3       // max chat list pages per invocation
-  const MAX_DELETIONS = 15  // cap deletions to fit within Worker subrequest limit
-  const PAGE_LIMIT = 20
+  const MAX_PAGES = 5       // max chat list pages per invocation
+  const MAX_DELETIONS = 30  // cap deletions to fit within Worker subrequest limit
+  const PAGE_LIMIT = 50
 
   while (pages < MAX_PAGES && totalDeleted < MAX_DELETIONS) {
     pages++
-    const resp = await fetch(`${root}/v3/chats?limit=${PAGE_LIMIT}&offset=${offset}&order=DESC&archived=false`, { headers })
+    const resp = await fetch(`${root}/v3/chats?limit=${PAGE_LIMIT}&offset=${offset}&order=ASC`, { headers })
     if (!resp.ok) {
-      return { cleaned: false, error: `List chats HTTP ${resp.status}`, checked: totalChecked, deleted: totalDeleted, agents: agentIds.length }
+      return { cleaned: false, error: `List chats HTTP ${resp.status}`, checked: totalChecked, deleted: totalDeleted }
     }
     const body = await resp.json()
     if (!body?.success) {
-      return { cleaned: false, error: body?.message || 'Arko list failed', checked: totalChecked, deleted: totalDeleted, agents: agentIds.length }
+      return { cleaned: false, error: body?.message || 'Arko list failed', checked: totalChecked, deleted: totalDeleted }
     }
 
     const rows = body.data?.rows || []
@@ -1092,9 +1089,8 @@ export async function cleanupOldChats(provider, aid, knownAgents, db) {
     for (const chat of rows) {
       totalChecked++
       if (totalDeleted >= MAX_DELETIONS) break
-      if (!agentSet.has(chat.agent?.id)) continue
-      // Keep chats updated within the retention window
-      if (chat.updated_at && chat.updated_at >= cutoffStr) continue
+      if (!chat.created_at) continue
+      if (chat.created_at >= cutoffStr) continue
       toDelete.push(chat.id)
     }
 
@@ -1105,12 +1101,15 @@ export async function cleanupOldChats(provider, aid, knownAgents, db) {
         const batch = toDelete.slice(i, i + batchSize)
         const results = await Promise.allSettled(batch.map(async (id) => {
           const r = await fetch(`${root}/v3/chats/${encodeURIComponent(id)}`, { method: 'DELETE', headers })
-          if (r.ok || r.status === 204 || r.status === 404) {
+          if (r.ok) {
             if (db) {
               await db.prepare('DELETE FROM chat_cids WHERE cid = ?').bind(id).run().catch(e => console.error('Failed to delete cid from D1:', e))
             }
             return true
           }
+          if (r.status === 404) return true
+          if (r.status === 403) console.error(`Cleanup DELETE 403 for chat ${id.slice(0,8)} — API key lacks chats:write scope`)
+          else console.error(`Cleanup DELETE ${r.status} for chat ${id.slice(0,8)}`)
           return false
         }))
         for (const r of results) {
@@ -1122,7 +1121,7 @@ export async function cleanupOldChats(provider, aid, knownAgents, db) {
     offset += PAGE_LIMIT
   }
 
-  return { cleaned: true, checked: totalChecked, deleted: totalDeleted, agents: agentIds.length }
+  return { cleaned: true, checked: totalChecked, deleted: totalDeleted }
 }
 
 export async function testProviderConnection(provider) {
@@ -1139,40 +1138,50 @@ export async function testProviderConnection(provider) {
   }
 }
 
-// ── WebSocket proxy ──────────────────────────────────────────────────
-export async function proxyArkoViaWS(provider, payload, ws, db) {
-  const stream = payload.stream !== false
-  let keepalive
+// ── SSE Streaming with keepalive (replaces WebSocket) ──────────────
+export async function proxyArkoSSE(provider, payload, db) {
+  const { readable, writable } = new TransformStream()
+  const writer = writable.getWriter()
+  const enc = new TextEncoder()
+  const model = payload.model || 'arko'
 
-  try {
-    // Start keepalive pings while waiting for Arko (fires between await ticks)
-    keepalive = setInterval(() => {
-      try { ws.send(JSON.stringify({ type: 'ping' })) } catch {}
-    }, 10000)
+  // Keepalive fires during await proxyArko() — CF Workers event loop
+  // processes timers between async await points; network wait doesn't
+  // count toward CPU time, and HTTP duration is unlimited on Free plan.
+  const keepalive = setInterval(() => {
+    try { writer.write(enc.encode(': keepalive\n\n')) } catch {}
+  }, 5000)
 
-    // Use proxyArko with long timeout (120s)
-    const result = await proxyArko(provider, { ...payload, stream: true }, true, db, 120000)
-    clearInterval(keepalive)
-    keepalive = null
+  ;(async () => {
+    try {
+      const result = await proxyArko(provider, payload, true, db)
+      clearInterval(keepalive)
 
-    if (result instanceof Response) {
-      // Streaming: pipe SSE response body → WebSocket messages
+      if (!(result instanceof Response)) throw new Error('Unexpected non-streaming result')
+
       const reader = result.body?.getReader()
       if (!reader) throw new Error('No response body')
       const decoder = new TextDecoder()
-
       while (true) {
         const { done, value } = await reader.read()
-        if (done) { ws.send(JSON.stringify({ type: 'done' })); break }
-        const text = decoder.decode(value, { stream: true })
-        if (text.trim()) ws.send(JSON.stringify({ type: 'sse', data: text }))
+        if (done) break
+        await writer.write(enc.encode(decoder.decode(value, { stream: true })))
       }
-    } else {
-      // Non-streaming JSON result
-      ws.send(JSON.stringify({ type: 'result', data: result }))
+    } catch (e) {
+      try {
+        await writer.write(enc.encode('data: ' + JSON.stringify({
+          id: 'chatcmpl-err', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
+          model, choices: [{ index: 0, delta: { content: '[錯誤: ' + e.message + ']' }, finish_reason: 'stop' }]
+        }) + '\n\n'))
+        await writer.write(enc.encode('data: [DONE]\n\n'))
+      } catch {}
+    } finally {
+      clearInterval(keepalive)
+      try { await writer.close() } catch {}
     }
-  } catch (e) {
-    if (keepalive) clearInterval(keepalive)
-    ws.send(JSON.stringify({ type: 'error', message: e.message }))
-  }
+  })()
+
+  return new Response(readable, {
+    headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' }
+  })
 }
