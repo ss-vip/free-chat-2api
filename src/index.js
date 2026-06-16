@@ -172,8 +172,8 @@ app.post('/api/playground/chat', async (c) => {
   const stream = rest.stream !== false
   const payload = { model, messages, stream, ...rest }
   try {
-    if (stream) return await proxyArkoSSE(provider, payload, c.env.DB)
-    const result = await proxyArko(provider, payload, false, c.env.DB)
+    if (stream) return await proxyArkoSSE(provider, payload, c.env.DB, rest.timeout_ms || 25000)
+    const result = await proxyArko(provider, payload, false, c.env.DB, rest.timeout_ms || 15000)
     return result instanceof Response ? result : c.json(result)
   } catch (e) {
     return c.json({ error: e.message }, 502)
@@ -213,8 +213,8 @@ app.post('/v1/chat/completions', async (c) => {
   const stream = rest.stream !== false
   const payload = { model, messages, stream, ...rest }
   try {
-    if (stream) return await proxyArkoSSE(provider, payload, c.env.DB)
-    const result = await proxyArko(provider, payload, false, c.env.DB)
+    if (stream) return await proxyArkoSSE(provider, payload, c.env.DB, rest.timeout_ms || 25000)
+    const result = await proxyArko(provider, payload, false, c.env.DB, rest.timeout_ms || 15000)
     return result instanceof Response ? result : c.json(result)
   } catch (e) {
     return c.json({ error: e.message }, 502)
@@ -556,6 +556,17 @@ const DASHBOARD_SCRIPT = [
 '  if (abortController) { abortController.abort(); abortController = null }',
 '}',
   '',
+ '',
+'function makeTitle(msgs) {',
+'  for (var i = 0; i < msgs.length; i++) {',
+'    if (msgs[i].role !== \'user\') continue',
+'    var t = (msgs[i].content || \'\').trim()',
+'    if (!t || t.length < 4 || /^(hi|hello|hey|嗨|你好|test|testing)$/i.test(t)) continue',
+'    return t.length > 40 ? t.slice(0, 40) + \'…\' : t',
+'  }',
+'  return \'新對話\'',
+'}',
+'',
 'function saveCurrentHistory() {',
 '  var bubbles = document.querySelectorAll("#chatBox .msg")',
 '  if (!bubbles.length) return',
@@ -568,36 +579,59 @@ const DASHBOARD_SCRIPT = [
 '    if (el.classList.contains("assistant") && text.trim()) msgs.push({ role: "assistant", content: text })',
 '  })',
 '  if (!msgs.length) return',
-'  var title = msgs[0]?.content?.slice(0,50) || "對話"',
+'  var title = makeTitle(msgs)',
 '  var history = JSON.parse(localStorage.getItem("chatHistory") || "[]")',
-'  var firstUser = ""',
-'  for (var i = 0; i < msgs.length; i++) { if (msgs[i].role === "user") { firstUser = msgs[i].content.slice(0,50); break } }',
 '  var convId = chatCid || document.getElementById("chatBox").dataset.convId || Date.now().toString()',
 '  document.getElementById("chatBox").dataset.convId = convId',
-'  var key = (firstUser || title) + "_" + convId',
+'  var key = convId',
 '  var existing = -1',
 '  for (var i = 0; i < history.length; i++) { if (history[i].key === key) { existing = i; break } }',
-'  var entry = { key: key, title: title, msgs: msgs, cid: chatCid, ts: Date.now() }',
+'  var lastMsg = msgs[msgs.length - 1]',
+'  var preview = lastMsg && lastMsg.role === \'assistant\' ? (lastMsg.content || \'\').replace(/<[^>]*>/g, \'\').trim().slice(0, 60) : \'\'',
+'  var entry = { key: key, title: title, msgs: msgs, cid: chatCid, ts: Date.now(), preview: preview }',
 '  if (existing >= 0) { history[existing] = entry } else { history.unshift(entry) }',
 '  localStorage.setItem("chatHistory", JSON.stringify(history))',
 '  renderHistory()',
 '}',
   '',
-  'function renderHistory() {',
-  '  var el = document.getElementById("convList")',
-  '  if (!el) return',
+ 'function renderHistory() {',
+'  var el = document.getElementById("convList")',
+'  if (!el) return',
 '  var history = JSON.parse(localStorage.getItem("chatHistory") || "[]")',
 '  var sorted = history.slice().sort(function(a,b) { return b.ts - a.ts })',
-'  var html = ""',
-'  html += "<button class=\'list-group-item list-group-item-action\' onclick=\'startNewChat()\'><strong>＋ 發起新對話</strong></button>"',
-'  sorted.forEach(function(h, idx) {',
-'    html += "<div class=\'list-group-item list-group-item-action d-flex justify-content-between align-items-center\' data-index=\'" + idx + "\' onclick=\'loadHistory(this)\'>"',
-'    html += "<span class=\'text-truncate\' style=\'max-width:160px\'>" + esc(h.title) + "</span>"',
-'    html += "<button class=\'btn btn-sm btn-outline-danger\' data-index=\'" + idx + "\' onclick=\'event.stopPropagation();deleteHistory(this)\'>✕</button>"',
-'    html += "</div>"',
+'  var groups = {}',
+'  var today = new Date(); today.setHours(0,0,0,0)',
+'  var yesterday = new Date(today); yesterday.setDate(yesterday.getDate() - 1)',
+'  var weekAgo = new Date(today); weekAgo.setDate(weekAgo.getDate() - 7)',
+'  sorted.forEach(function(h) {',
+'    var d = new Date(h.ts)',
+'    var label = d >= today ? "今天" : d >= yesterday ? "昨天" : d >= weekAgo ? "這週" : "更早"',
+'    if (!groups[label]) groups[label] = []',
+'    groups[label].push(h)',
 '  })',
-  '  el.innerHTML = html',
-  '}',
+'  var html = ""',
+'  html += "<button class=\'list-group-item list-group-item-action\' onclick=\'startNewChat()\' style=\'background:transparent;border:none;color:var(--accent);font-weight:600\'><strong>＋ 新對話</strong></button>"',
+'  var groupKeys = ["今天","昨天","這週","更早"]',
+'  for (var gi = 0; gi < groupKeys.length; gi++) {',
+'    var label = groupKeys[gi]',
+'    var items = groups[label]',
+'    if (!items || !items.length) continue',
+'    html += "<div class=\'history-group-label\'>" + label + "</div>"',
+'    for (var hi = 0; hi < items.length; hi++) {',
+'      var h = items[hi]',
+'      var preview = h.preview || ""',
+'      html += "<div class=\'history-item\' data-key=\'" + h.key + "\' onclick=\'loadHistory(this)\' ondblclick=\'startRename(this)\'>"',
+'      html += "<div class=\'h-title\'>" + esc(h.title) + "</div>"',
+'      if (preview) html += "<div class=\'h-preview\'>" + esc(preview) + "</div>"',
+'      html += "<button class=\'h-del\' onclick=\'event.stopPropagation();deleteHistory(this)\' title=\'刪除\'>✕</button>"',
+'      html += "</div>"',
+'    }',
+'  }',
+  '  if (!sorted.length) {',
+'    html += "<div class=\'empty-history\'><div class=\'empty-icon\'>💬</div>尚無對話紀錄<br><small>開始發送訊息吧</small></div>"',
+'  }',
+'  el.innerHTML = html',
+'}',
   '',
 'function startNewChat() {',
 '  saveCurrentHistory()',
@@ -608,46 +642,80 @@ const DASHBOARD_SCRIPT = [
 '  if (abortController) { abortController.abort(); abortController = null }',
 '}',
   '',
-'function loadHistory(el) {',
-'  var idx = parseInt(el.dataset.index)',
+ 'function loadHistory(el) {',
+'  var key = el.dataset.key || ""',
+'  if (!key) return',
 '  var history = JSON.parse(localStorage.getItem("chatHistory") || "[]")',
-'  var sorted = history.slice().sort(function(a,b) { return b.ts - a.ts })',
-'  if (idx < 0 || idx >= sorted.length) return',
-'  var entry = sorted[idx]',
-   '  document.getElementById("chatBox").innerHTML = ""',
-   '  chatCid = entry.cid || ""',
-   '  document.getElementById("chatBox").dataset.convId = chatCid || entry.key || ""',
-  '  if (abortController) { abortController.abort(); abortController = null }',
-  '  for (var j = 0; j < entry.msgs.length; j++) {',
-  '    var m = entry.msgs[j]',
-  '    if (m.role === "system") { document.getElementById("systemPrompt").value = m.content; continue }',
-  '    var d = document.createElement("div")',
-  '    d.className = "msg " + m.role',
-  '    d.dataset.raw = m.content',
-  '    if (m.role === "user") { d.textContent = m.content }',
-  '    else { d.innerHTML = window.marked ? marked.parse(m.content) : esc(m.content) }',
-  '    document.getElementById("chatBox").appendChild(d)',
-  '  }',
-  '  if (window.hljs) enhanceCode(document.getElementById("chatBox"))',
-  '}',
+'  var entry = null',
+'  for (var i = 0; i < history.length; i++) { if (history[i].key === key) { entry = history[i]; break } }',
+'  if (!entry) return',
+'  document.getElementById("chatBox").innerHTML = ""',
+'  chatCid = entry.cid || ""',
+'  document.getElementById("chatBox").dataset.convId = chatCid || entry.key || ""',
+'  if (abortController) { abortController.abort(); abortController = null }',
+'  for (var j = 0; j < entry.msgs.length; j++) {',
+'    var m = entry.msgs[j]',
+'    if (m.role === "system") { document.getElementById("systemPrompt").value = m.content; continue }',
+'    var d = document.createElement("div")',
+'    d.className = "msg " + m.role',
+'    d.dataset.raw = m.content',
+'    if (m.role === "user") { d.textContent = m.content }',
+'    else { d.innerHTML = window.marked ? marked.parse(m.content) : esc(m.content) }',
+'    document.getElementById("chatBox").appendChild(d)',
+'  }',
+'  if (window.hljs) enhanceCode(document.getElementById("chatBox"))',
+'}',
   '',
-'function deleteHistory(el) {',
-'  var idx = parseInt(el.dataset.index)',
+ 'function deleteHistory(el) {',
+'  var key = el.parentNode ? el.parentNode.dataset.key || "" : ""',
+'  if (!key) return',
+'  if (!confirm("確定刪除此對話？")) return',
 '  var history = JSON.parse(localStorage.getItem("chatHistory") || "[]")',
-'  var sorted = history.slice().sort(function(a,b) { return b.ts - a.ts })',
-'  if (idx < 0 || idx >= sorted.length) return',
-'  var entry = sorted[idx]',
-'  var realIdx = history.indexOf(entry)',
-'  if (realIdx >= 0) history.splice(realIdx, 1)',
+'  for (var i = 0; i < history.length; i++) {',
+'    if (history[i].key === key) { history.splice(i, 1); break }',
+'  }',
 '  localStorage.setItem("chatHistory", JSON.stringify(history))',
 '  renderHistory()',
 '}',
   '',
-  'function clearAllHistory() {',
-  '  if (!confirm("確定刪除所有歷史對話？")) return',
-  '  localStorage.removeItem("chatHistory")',
-  '  renderHistory()',
-  '}',
+ 'function clearAllHistory() {',
+ '  if (!confirm("確定刪除所有歷史對話？")) return',
+'  localStorage.removeItem("chatHistory")',
+'  renderHistory()',
+'}',
+'',
+'function startRename(el) {',
+'  var key = el.dataset.key || ""',
+'  if (!key) return',
+'  var titleEl = el.querySelector(".h-title")',
+'  if (!titleEl || titleEl.querySelector("input")) return',
+'  var old = titleEl.textContent',
+'  var input = document.createElement("input")',
+'  input.className = "form-control form-control-sm"',
+'  input.type = "text"',
+'  input.value = old',
+'  input.onblur = function() {',
+'    var val = input.value.trim() || old',
+'    renameHistory(key, val)',
+'    titleEl.innerHTML = esc(val)',
+'  }',
+'  input.onkeydown = function(e) {',
+'    if (e.key === "Enter") input.blur()',
+'    if (e.key === "Escape") { titleEl.innerHTML = esc(old); return }',
+'  }',
+'  titleEl.innerHTML = ""',
+'  titleEl.appendChild(input)',
+'  input.focus()',
+'  input.select()',
+'}',
+'',
+'function renameHistory(key, newTitle) {',
+'  var history = JSON.parse(localStorage.getItem("chatHistory") || "[]")',
+'  for (var i = 0; i < history.length; i++) {',
+'    if (history[i].key === key) { history[i].title = newTitle; break }',
+'  }',
+  '  localStorage.setItem("chatHistory", JSON.stringify(history))',
+'}',
 'var abortController = null',
 'var chatCid = ""',
 'var lastSendTime = 0',
@@ -699,7 +767,7 @@ const DASHBOARD_SCRIPT = [
   '    var r = await fetch(API_BASE + "/api/playground/chat", {',
   '      method: "POST", credentials: "include",',
   '      headers: { "Content-Type": "application/json" },',
-  '      body: JSON.stringify({ model: model, messages: messages, stream: true, cid: chatCid || undefined }),',
+  '      body: JSON.stringify({ model: model, messages: messages, stream: true, timeout_ms: 30000, cid: chatCid || undefined }),',
   '      signal: abortController.signal',
   '    })',
   '    if (!r.ok) { var ej = await r.json(); throw new Error(ej.error || r.statusText) }',
@@ -752,7 +820,7 @@ const DASHBOARD_SCRIPT = [
 '      var r2 = await fetch(API_BASE + "/api/playground/chat", {',
 '        method: "POST", credentials: "include",',
 '        headers: { "Content-Type": "application/json" },',
-'        body: JSON.stringify({ model: model, messages: messages, stream: true }),',
+  '        body: JSON.stringify({ model: model, messages: messages, stream: true, timeout_ms: 30000 }),',
 '        signal: abortController.signal',
 '      })',
 '      if (r2.ok) {',
@@ -837,7 +905,7 @@ const DASHBOARD_SCRIPT = [
 '}',
 '',
 'document.getElementById("userInput").addEventListener("input", function() { this.style.height = "auto"; this.style.height = Math.min(this.scrollHeight, 160) + "px" })',
-';document.getElementById("userInput").addEventListener("keydown", function(e) { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendPlayground() } })',
+';document.getElementById("userInput").addEventListener("keydown", function(e) { if (e.key === "Enter" && e.shiftKey) { e.preventDefault(); sendPlayground() } })',
 ].join('\n')
 
 function dashboardHtml(origin) {
@@ -906,6 +974,17 @@ body{font-family:'Inter',sans-serif;background:var(--bg-gradient);background-att
 .chat-box .msg.system{background:rgba(255,193,7,.1);color:var(--bs-warning);text-align:center;max-width:100%;font-size:.85rem;border:1px solid rgba(255,193,7,.2)}
 .chat-box .msg.error{background:rgba(220,53,69,.1);color:#ff6b6b;text-align:center;max-width:100%;border:1px solid rgba(220,53,69,.2)}
 .token-display{font-family:monospace;background:rgba(0,0,0,0.2);padding:0.75rem 1rem;border-radius:8px;border:1px solid var(--glass-border);word-break:break-all}
+/* History sidebar */
+.history-group-label{font-size:.7rem;color:#8b949e;padding:.4rem .6rem .2rem;text-transform:uppercase;letter-spacing:.05em;font-weight:600}
+.history-item{padding:.4rem .6rem;cursor:pointer;border-radius:8px;transition:background .15s;margin:.1rem 0;position:relative}
+.history-item:hover{background:rgba(255,255,255,.05)}
+.history-item .h-title{font-size:.82rem;color:#e2e8f0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-right:24px}
+.history-item .h-preview{font-size:.72rem;color:#6c757d;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.history-item .h-del{position:absolute;right:6px;top:8px;opacity:0;transition:opacity .15s;background:none;border:none;color:#dc3545;cursor:pointer;font-size:.75rem;padding:2px 4px;line-height:1}
+.history-item:hover .h-del{opacity:1}
+.history-item .h-title input.form-control{height:24px;font-size:.82rem;padding:0 4px;display:inline-block;width:calc(100% - 24px)}
+.empty-history{text-align:center;padding:2rem .5rem;color:#6c757d;font-size:.85rem}
+.empty-history .empty-icon{font-size:2rem;margin-bottom:.5rem}
 .toast-container{position:fixed;top:70px;right:1rem;z-index:99999}
 .toast{background:var(--glass-bg)!important;backdrop-filter:blur(12px);border:1px solid var(--glass-border)!important;color:#fff!important}
 .form-label{font-size:.875rem;color:#adb5bd;font-weight:500}
@@ -1095,7 +1174,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg-gradient);background-att
       </div>
       <div class="chat-box" id="chatBox"></div>
       <div class="input-group">
-        <textarea class="form-control" id="userInput" placeholder="輸入訊息... (Enter 發送, Shift+Enter 換行)" rows="3" style="resize:none"></textarea>
+        <textarea class="form-control" id="userInput" placeholder="輸入訊息... (Shift+Enter 發送, Enter 換行)" rows="3" style="resize:none"></textarea>
         <button class="btn btn-info" id="playgroundSend" onclick="sendPlayground()">發送</button>
       </div>
     </div>

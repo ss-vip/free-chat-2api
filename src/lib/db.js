@@ -5,6 +5,24 @@ export function generateToken() {
   return 'sk-' + Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('')
 }
 
+// Image generation keywords — used to detect image-gen requests and extend timeout
+const IMAGE_GEN_KEYWORDS = [
+  'draw', 'generate', 'create', 'make', 'render', 'produce',
+  'picture', 'image', 'illustration', 'painting', 'art', 'design',
+  'diagram', 'chart', 'graph', 'visual', 'sketch', 'doodle',
+  'photo', 'photograph', 'portrait', 'landscape', 'poster', 'flyer',
+  'meme', 'cartoon', 'comic', 'animation', 'icon', 'logo', 'banner',
+  '繪製', '生成', '創建', '建立', '渲染', '畫', '畫出', '畫一張',
+  '圖片', '圖像', '圖案', '插圖', '設計', '海報', 'logo',
+  '照片', '肖像', '風景', '漫畫',
+]
+const likelyImageGen = (content) => {
+  if (!content || typeof content !== 'string') return false
+  const c = content.toLowerCase().trim()
+  if (!c || c.length < 3) return false
+  return IMAGE_GEN_KEYWORDS.some(kw => c.includes(kw))
+}
+
 // ── Schema init & migrations ──────────────────────────────────────
 export async function initDB(db) {
   // Core tables
@@ -494,6 +512,27 @@ function generateMockToolCall(tools, userMsg) {
 }
 
 // ── Arko stream parsing ──────────────────────────────────────────
+function extractDoneContent(json) {
+  // Priority: messages-based extraction FIRST, then fall back to direct content fields
+  // (done event's json.content is often the user's message, not assistant response)
+  // Check messages arrays first for the assistant's actual response
+  if (json.data?.messages?.length) {
+    const asst = [...json.data.messages].reverse().find(m => m.role === 'assistant' && m.content)
+    if (asst?.content) return asst.content
+  }
+  if (Array.isArray(json.messages)) {
+    const asst = [...json.messages].reverse().find(m => m.role === 'assistant' && m.content)
+    if (asst?.content) return asst.content
+  }
+  // Direct content fields (use as last resort)
+  if (json.assistant?.content) return json.assistant.content
+  if (json.choices?.[0]?.message?.content) return json.choices[0].message.content
+  if (json.choices?.[0]?.delta?.content) return json.choices[0].delta.content
+  if (json.content) return json.content
+  if (json.text) return json.text
+  return ''
+}
+
 function parseArkoJSON(obj) {
   if (obj?.success === true && obj?.data?.messages) {
     const chatId = obj.data.chat?.id || ''
@@ -616,6 +655,10 @@ function streamArkoToSSE(response, model, sid, cid, db, allUserMsgs, currentAid,
                   model, choices: [{ index: 0, delta: { content: '[Arko 錯誤: ' + (json.message || json.code || 'unknown') + ']' }, finish_reason: null }]
                 }) + '\n\n'))
                 if (!fullContent) fullContent = ''
+              } else if (json.type === 'done') {
+                const doneContent = extractDoneContent(json)
+                if (doneContent) fullContent += doneContent
+                if (!fullContent) fullContent = ''
               }
             } catch {}
           }
@@ -644,25 +687,15 @@ function streamArkoToSSE(response, model, sid, cid, db, allUserMsgs, currentAid,
               }) + '\n\n'))
               if (!fullContent) fullContent = ''
             } else if (json.type === 'done') {
-              // Always use complete assistant content from done.messages
-              // (deltas may be partial due to tool_call interruptions)
-              if (Array.isArray(json.messages)) {
-                const lastAssistant = [...json.messages].reverse().find(m => m.role === 'assistant' && m.content)
-                if (lastAssistant?.content && lastAssistant.content.length > fullContent.length) {
-                  const remaining = lastAssistant.content.slice(fullContent.length)
-                  if (remaining) {
-                    fullContent = lastAssistant.content
-                    await writer.write(enc.encode('data: ' + JSON.stringify({
-                      id: sid, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
-                      model, choices: [{ index: 0, delta: { content: remaining }, finish_reason: null }],
-                      _cid: cid || chatId
-                    }) + '\n\n'))
-                  }
-                } else if (lastAssistant?.content && !fullContent) {
-                  fullContent = lastAssistant.content
+              // Extract content using robust multi-format handler
+              const doneContent = extractDoneContent(json)
+              if (doneContent) {
+                if (doneContent !== fullContent) {
+                  // Write assistant's actual response (avoids user prompt echo in deltas)
+                  fullContent = doneContent
                   await writer.write(enc.encode('data: ' + JSON.stringify({
                     id: sid, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
-                    model, choices: [{ index: 0, delta: { content: lastAssistant.content }, finish_reason: null }],
+                    model, choices: [{ index: 0, delta: { content: doneContent }, finish_reason: null }],
                     _cid: cid || chatId
                   }) + '\n\n'))
                 }
@@ -678,6 +711,17 @@ function streamArkoToSSE(response, model, sid, cid, db, allUserMsgs, currentAid,
               }) + '\n\n'))
               await writer.write(enc.encode('data: [DONE]\n\n'))
               return
+            } else {
+              // Fallback: try Arko JSON format (no type field)
+              const fb = extractDoneContent(json)
+              if (fb && !fullContent) {
+                fullContent = fb
+                await writer.write(enc.encode('data: ' + JSON.stringify({
+                  id: sid, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
+                  model, choices: [{ index: 0, delta: { content: fb }, finish_reason: null }],
+                  ...(chatId ? { _cid: chatId } : {})
+                }) + '\n\n'))
+              }
             }
           } catch {}
         }
@@ -762,12 +806,6 @@ export async function proxyArko(provider, payload, stream, db, wsTimeoutMs) {
   const toolChoice = payload.tool_choice
   const toolsActive = hasTools && toolChoice !== 'none'
 
-  // Tool result passthrough
-  if (toolsActive && lastMsg.role === 'tool') {
-    const r = lastMsg.content || ''
-    return stream ? openAIStreamResponse(model, r, null, payload.cid) : openAICompletion(model, r, null, payload.cid)
-  }
-
   // Tool intent detection
   const lastUser = [...messages].reverse().find(m => m.role === 'user')
   const systemMsg = messages.find(m => m.role === 'system')
@@ -783,6 +821,73 @@ export async function proxyArko(provider, payload, stream, db, wsTimeoutMs) {
   const baseContent = normalizeContent(lastUser?.content)
   const sysContent = normalizeContent(systemMsg?.content)
   const contentWithSystem = sysContent ? `[System Instructions]\n${sysContent}\n\n${baseContent}` : baseContent
+
+  // Shared arko helpers (need to be before tool result passthrough which uses callArko)
+  const url = provider.base_url.replace(/\/+$/, '') + '/v3/messages'
+  const headers = { 'Content-Type': 'application/json' }
+  if (provider.api_key) headers['Authorization'] = 'Bearer ' + provider.api_key
+
+  const callArko = async (body, timeoutMs = wsTimeoutMs || 8000) => {
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs)
+    try {
+      const r = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: ctrl.signal })
+      if (!r.ok) throw new Error('Arko HTTP ' + r.status + ': ' + (await r.text().catch(() => '')).slice(0, 500))
+      return r
+    } finally { clearTimeout(timer) }
+  }
+
+  // Tool result passthrough: route to Arko with context instead of raw passthrough
+  if (lastMsg.role === 'tool') {
+    const toolResult = normalizeContent(lastMsg.content) || ''
+    const lastAssistant = [...messages].reverse().find(m => m.role === 'assistant' && m.tool_calls)
+    const origUser = [...messages].reverse().find(m => m.role === 'user')
+    const origContent = normalizeContent(origUser?.content || '')
+    const toolName = lastAssistant?.tool_calls?.[0]?.function?.name || 'unknown'
+    const toolArgs = lastAssistant?.tool_calls?.[0]?.function?.arguments || '{}'
+    const prompt = `[User request: ${origContent}]\n[Tool called: ${toolName} with args: ${toolArgs}]\n[Tool result: ${toolResult}]\nRespond to the user in natural language based on this result. If the result is empty, say the tool returned nothing.`
+    const allUserMsgs = messages.filter(m => m.role === 'user').map(m => normalizeContent(m.content))
+    const prevMsgs = allUserMsgs.slice(0, allUserMsgs.length - (messages[messages.length - 1]?.role === 'user' ? 1 : 0))
+    const aids = aid.split(',').map(s => s.trim()).filter(Boolean)
+    if (!aids.length) throw new Error('No valid AIDs configured')
+    let lastErr = null
+    for (let cycle = 0; cycle < 3; cycle++) {
+      for (const currentAid of aids) {
+        const now = Date.now()
+        const lastTime = lastArkoCall.get(currentAid) || 0
+        if (now - lastTime < 1000) await sleep(1000 - (now - lastTime))
+        lastArkoCall.set(currentAid, Date.now())
+        let resolvedCid = payload.cid || null
+        if (db && !resolvedCid && prevMsgs.length) {
+          const hashStr = JSON.stringify(prevMsgs)
+          const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(hashStr))
+          const lookupHash = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 64)
+          const row = await db.prepare('SELECT cid FROM chat_cids WHERE ctx_hash = ? AND aid = ?').bind(lookupHash, currentAid).first()
+          if (row?.cid) resolvedCid = row.cid
+        }
+        const body = { content: sysContent ? `[System Instructions]\n${sysContent}\n\n${prompt}` : prompt, stream: true, aid: currentAid, ...(resolvedCid ? { cid: resolvedCid } : {}) }
+        const imgTimeout = likelyImageGen(body.content) ? Math.min(wsTimeoutMs || 10000 * 2, 28000) : (wsTimeoutMs || 10000)
+        try {
+          const resp = await callArko(body, imgTimeout)
+          const parsed = await readArkoStream(resp)
+          if (parsed.content) {
+            if (db && parsed.chatId && prevMsgs.length) {
+              const hashStr = JSON.stringify(prevMsgs)
+              const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(hashStr))
+              const ctxHash2 = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 64)
+              try { await saveChatCid(db, ctxHash2, parsed.chatId, currentAid) } catch {}
+            }
+            return stream ? openAIStreamResponse(model, parsed.content, null, parsed.chatId || payload.cid) : openAICompletion(model, parsed.content, null, parsed.chatId || payload.cid)
+          }
+        } catch (e) {
+          lastErr = e
+        }
+        const backoff = [500, 1000, 2000][Math.min(cycle, 2)]
+        await sleep(backoff)
+      }
+    }
+    throw new Error('Arko returned empty content for tool result' + (lastErr ? ': ' + lastErr.message : ''))
+  }
 
   // Build tool descriptions (shared between tool and non-tool paths)
   let toolDesc = ''
@@ -800,21 +905,6 @@ export async function proxyArko(provider, payload, stream, db, wsTimeoutMs) {
   // Validate non-empty message content before calling Arko API
   if (!contentWithSystem?.trim() && !toolsActive) {
     throw new Error('Message content is empty — provide a user message')
-  }
-
-  // Shared arko helpers
-  const url = provider.base_url.replace(/\/+$/, '') + '/v3/messages'
-  const headers = { 'Content-Type': 'application/json' }
-  if (provider.api_key) headers['Authorization'] = 'Bearer ' + provider.api_key
-
-  const callArko = async (body, timeoutMs = wsTimeoutMs || 8000) => {
-    const ctrl = new AbortController()
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs)
-    try {
-      const r = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: ctrl.signal })
-      if (!r.ok) throw new Error('Arko HTTP ' + r.status + ': ' + (await r.text().catch(() => '')).slice(0, 500))
-      return r
-    } finally { clearTimeout(timer) }
   }
 
   const cleanParam = (v) => typeof v === 'string' ? v.replace(/^(?:for |about |on |command |run |execute |search |find |look up |fetch |check |get )/i, '').trim() : v
@@ -887,7 +977,7 @@ export async function proxyArko(provider, payload, stream, db, wsTimeoutMs) {
         `- If the user's intent does NOT match any tool, respond normally as a helpful assistant\n\n` +
         `Conversation History:\n${recentHistory}\n\nExtract parameters for the final User request.`
       try {
-        const resp = await callArko({ content: ep, stream: true, aid }, 8000)
+        const resp = await callArko({ content: ep, stream: true, aid }, wsTimeoutMs || 10000)
         const parsed = await readArkoStream(resp)
         const tc = tryExtractToolCall(parsed.content || '', tools)
           if (tc) {
@@ -965,8 +1055,12 @@ export async function proxyArko(provider, payload, stream, db, wsTimeoutMs) {
   }
 
   let lastErr = null
-  for (let cycle = 0; cycle < 3; cycle++) {
-    for (const currentAid of aidOrder) {
+  const isImageGen = likelyImageGen(contentWithSystem)
+  const maxCycles = isImageGen ? 1 : 3
+  const callTimeout = isImageGen ? Math.min((wsTimeoutMs || 8000) * 2, 28000) : (wsTimeoutMs || 8000)
+  const attemptAids = isImageGen ? [aidOrder[0]].filter(Boolean) : aidOrder
+  for (let cycle = 0; cycle < maxCycles; cycle++) {
+    for (const currentAid of attemptAids) {
       const now = Date.now()
       const lastTime = lastArkoCall.get(currentAid) || 0
       if (now - lastTime < 1000) await sleep(1000 - (now - lastTime))
@@ -980,19 +1074,16 @@ export async function proxyArko(provider, payload, stream, db, wsTimeoutMs) {
 
       const body = { content: contentWithSystem, stream: true, aid: currentAid, ...(resolvedCid ? { cid: resolvedCid } : {}) }
       try {
-        const resp = await callArko(body, 8000)
+        const resp = await callArko(body, callTimeout)
 
-        if (stream) {
-          const sid = makeCompletionId()
-          return streamArkoToSSE(resp, model, sid, payload.cid, db, allUserMsgs, currentAid, ctxHash)
-        }
-
+        // Always read full NDJSON to validate content before returning
         const parsed = await readArkoStream(resp)
         if (parsed.content) {
           if (db && parsed.chatId && ctxHash) {
             try { await saveChatCid(db, ctxHash, parsed.chatId, currentAid) } catch {}
           }
-          return openAICompletion(model, parsed.content, null, parsed.chatId)
+          if (stream) return openAIStreamResponse(model, parsed.content, null, parsed.chatId || payload.cid)
+          return openAICompletion(model, parsed.content, null, parsed.chatId || payload.cid)
         }
       } catch (e) {
         lastErr = e
@@ -1139,7 +1230,7 @@ export async function testProviderConnection(provider) {
 }
 
 // ── SSE Streaming with keepalive (replaces WebSocket) ──────────────
-export async function proxyArkoSSE(provider, payload, db) {
+export async function proxyArkoSSE(provider, payload, db, wsTimeoutMs) {
   const { readable, writable } = new TransformStream()
   const writer = writable.getWriter()
   const enc = new TextEncoder()
@@ -1147,14 +1238,14 @@ export async function proxyArkoSSE(provider, payload, db) {
 
   // Keepalive fires during await proxyArko() — CF Workers event loop
   // processes timers between async await points; network wait doesn't
-  // count toward CPU time, and HTTP duration is unlimited on Free plan.
+  // count toward CPU time.
   const keepalive = setInterval(() => {
     try { writer.write(enc.encode(': keepalive\n\n')) } catch {}
   }, 5000)
 
   ;(async () => {
     try {
-      const result = await proxyArko(provider, payload, true, db)
+      const result = await proxyArko(provider, payload, true, db, wsTimeoutMs)
       clearInterval(keepalive)
 
       if (!(result instanceof Response)) throw new Error('Unexpected non-streaming result')
