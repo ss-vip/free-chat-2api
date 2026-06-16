@@ -751,7 +751,7 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms))
 const lastArkoCall = new Map()
 let aidRotateCounter = 0
 
-export async function proxyArko(provider, payload, stream, db) {
+export async function proxyArko(provider, payload, stream, db, wsTimeoutMs) {
   const messages = payload.messages || []
   const tools = payload.tools || payload.functions || []
   const hasTools = !!(tools.length)
@@ -792,7 +792,7 @@ export async function proxyArko(provider, payload, stream, db) {
   const headers = { 'Content-Type': 'application/json' }
   if (provider.api_key) headers['Authorization'] = 'Bearer ' + provider.api_key
 
-  const callArko = async (body, timeoutMs = 8000) => {
+  const callArko = async (body, timeoutMs = wsTimeoutMs || 8000) => {
     const ctrl = new AbortController()
     const timer = setTimeout(() => ctrl.abort(), timeoutMs)
     try {
@@ -1136,5 +1136,43 @@ export async function testProviderConnection(provider) {
     return { ok: false, error: 'No content from arko' }
   } catch (e) {
     return { ok: false, error: e.message }
+  }
+}
+
+// ── WebSocket proxy ──────────────────────────────────────────────────
+export async function proxyArkoViaWS(provider, payload, ws, db) {
+  const stream = payload.stream !== false
+  let keepalive
+
+  try {
+    // Start keepalive pings while waiting for Arko (fires between await ticks)
+    keepalive = setInterval(() => {
+      try { ws.send(JSON.stringify({ type: 'ping' })) } catch {}
+    }, 10000)
+
+    // Use proxyArko with long timeout (120s)
+    const result = await proxyArko(provider, { ...payload, stream: true }, true, db, 120000)
+    clearInterval(keepalive)
+    keepalive = null
+
+    if (result instanceof Response) {
+      // Streaming: pipe SSE response body → WebSocket messages
+      const reader = result.body?.getReader()
+      if (!reader) throw new Error('No response body')
+      const decoder = new TextDecoder()
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) { ws.send(JSON.stringify({ type: 'done' })); break }
+        const text = decoder.decode(value, { stream: true })
+        if (text.trim()) ws.send(JSON.stringify({ type: 'sse', data: text }))
+      }
+    } else {
+      // Non-streaming JSON result
+      ws.send(JSON.stringify({ type: 'result', data: result }))
+    }
+  } catch (e) {
+    if (keepalive) clearInterval(keepalive)
+    ws.send(JSON.stringify({ type: 'error', message: e.message }))
   }
 }

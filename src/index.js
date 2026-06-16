@@ -5,6 +5,7 @@ import {
   getDashboardPasswordHash, setDashboardPasswordHash,
   getProvider, updateProvider, sanitizeProvider,
   proxyArko, testProviderConnection, cleanupOldChats, listAgents,
+  proxyArkoViaWS,
   createSession, getValidSession, deleteSession, deleteExpiredSessions
 } from './lib/db.js'
 import {
@@ -217,6 +218,45 @@ app.post('/v1/chat/completions', async (c) => {
   }
 })
 
+// ---- WebSocket for long-running operations ----
+app.get('/ws', async (c) => {
+  const upgrade = c.req.header('Upgrade')
+  if (upgrade?.toLowerCase() !== 'websocket') return c.text('Expected WebSocket upgrade', 426)
+
+  const [client, server] = Object.values(new WebSocketPair())
+  server.accept()
+
+  // Auth via query param
+  const queryToken = c.req.query('token')
+
+  server.addEventListener('message', async (event) => {
+    let payload
+    try { payload = JSON.parse(event.data) } catch {
+      server.send(JSON.stringify({ type: 'error', message: 'Invalid JSON' }))
+      server.close(); return
+    }
+
+    const stored = await getClientToken(c.env.DB)
+    const token = queryToken || payload.token || c.req.header('Authorization')?.replace('Bearer ', '')
+    if (stored && token !== stored) {
+      server.send(JSON.stringify({ type: 'error', message: 'Unauthorized' }))
+      server.close(); return
+    }
+
+    try {
+      const provider = await getProvider(c.env.DB)
+      if (!provider) throw new Error('No provider configured')
+      await proxyArkoViaWS(provider, payload, server, c.env.DB)
+    } catch (e) {
+      server.send(JSON.stringify({ type: 'error', message: e.message }))
+    } finally {
+      server.close(1000, 'complete')
+    }
+  })
+
+  return new Response(null, { status: 101, webSocket: client })
+})
+
 // ---- Debug ----
 app.post('/api/debug/chat', async (c) => {
   const body = await c.req.json()
@@ -257,7 +297,6 @@ app.get('/health', async (c) => {
     // List all agents
     const agents = await listAgents(provider)
     const channels = agents.map(a => ({
-      agent_id: a.id,
       agent_name: a.name || '(unknown)',
       status: 'active'
     }))
@@ -353,8 +392,11 @@ const DASHBOARD_SCRIPT = [
   '// Start auth check when DOM is ready',
   'document.addEventListener("DOMContentLoaded", function() { checkAuth() })',
   '',
+  'const loginPw = document.getElementById("loginPassword")',
+  'loginPw.addEventListener("keydown", function(e) { if (e.key === "Enter") { e.preventDefault(); doLogin() } })',
+  '',
   'async function doLogin() {',
-  '  const pw = document.getElementById("loginPassword").value',
+  '  const pw = loginPw.value',
   '  const r = await fetch(API_BASE + "/api/auth/login", {',
   '    method: "POST", credentials: "include",',
   '    headers: { "Content-Type": "application/json" },',
