@@ -881,7 +881,9 @@ export async function proxyArko(provider, payload, stream, db, wsTimeoutMs) {
     const aids = aid.split(',').map(s => s.trim()).filter(Boolean)
     if (!aids.length) throw new Error('No valid AIDs configured')
     let lastErr = null
+    const toolStart = Date.now()
     for (let cycle = 0; cycle < 3; cycle++) {
+      if (Date.now() - toolStart >= 25000) break
       for (const currentAid of aids) {
         const now = Date.now()
         const lastTime = lastArkoCall.get(currentAid) || 0
@@ -895,6 +897,7 @@ export async function proxyArko(provider, payload, stream, db, wsTimeoutMs) {
           const row = await db.prepare('SELECT cid FROM chat_cids WHERE ctx_hash = ? AND aid = ?').bind(lookupHash, currentAid).first()
           if (row?.cid) resolvedCid = row.cid
         }
+        if (Date.now() - toolStart >= 25000) break
         const body = { content: `[System Instructions]\n${sysContent || 'You are a helpful AI assistant.'}\n\n${prompt}`, stream: true, aid: currentAid, ...(resolvedCid ? { cid: resolvedCid } : {}) }
         const imgTimeout = likelyImageGen(body.content) ? Math.min(wsTimeoutMs || 10000 * 2, 28000) : (wsTimeoutMs || 10000)
         try {
@@ -1087,9 +1090,12 @@ export async function proxyArko(provider, payload, stream, db, wsTimeoutMs) {
   let lastErr = null
   const isImageGen = likelyImageGen(contentWithSystem)
   const maxCycles = isImageGen ? 1 : 3
+  const MAX_DURATION_MS = 25000
+  const startTime = Date.now()
   const callTimeout = isImageGen ? Math.min((wsTimeoutMs || 8000) * 2, 28000) : (wsTimeoutMs || 8000)
   const attemptAids = isImageGen ? [aidOrder[0]].filter(Boolean) : aidOrder
   for (let cycle = 0; cycle < maxCycles; cycle++) {
+    if (Date.now() - startTime >= MAX_DURATION_MS) break
     for (const currentAid of attemptAids) {
       const now = Date.now()
       const lastTime = lastArkoCall.get(currentAid) || 0
@@ -1102,6 +1108,7 @@ export async function proxyArko(provider, payload, stream, db, wsTimeoutMs) {
         if (row?.cid) resolvedCid = row.cid
       }
 
+      if (Date.now() - startTime >= MAX_DURATION_MS) break
       const body = { content: contentWithSystem, stream: true, aid: currentAid, ...(resolvedCid ? { cid: resolvedCid } : {}) }
       try {
         const resp = await callArko(body, callTimeout)
@@ -1217,7 +1224,7 @@ export async function cleanupOldChats(provider, aid, knownAgents, db) {
 
     // Delete matches concurrently in batches
     if (toDelete.length) {
-      const batchSize = 5
+      const batchSize = 4
       for (let i = 0; i < toDelete.length && totalDeleted < MAX_DELETIONS; i += batchSize) {
         const batch = toDelete.slice(i, i + batchSize)
         const results = await Promise.allSettled(batch.map(async (id) => {
