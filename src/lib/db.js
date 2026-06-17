@@ -552,6 +552,7 @@ export async function readArkoStream(response) {
     return { content: obj.content || obj.text || JSON.stringify(obj) }
   }
   let full = '', chatId = ''
+  let lastError = null
   const reader = response.body?.getReader()
   if (!reader) return { content: '' }
   const decoder = new TextDecoder()
@@ -575,18 +576,19 @@ export async function readArkoStream(response) {
         const json = JSON.parse(line)
         if (json.type === 'chat' && json.id) chatId = json.id
         else if (json.type === 'delta' && json.content) full += json.content
-        else if (json.type === 'done') {
-          if (json.content) full += json.content
-          // Drain remaining buffer then stop
-          if (json.messages?.length) {
-            const msgs = json.messages
-            const asst = [...msgs].reverse().find(m => m.role === 'assistant' && m.content)
-            if (asst?.content) full = asst.content
-          }
+        else if (json.type === 'error') {
+          lastError = json.message || json.code || 'unknown'
+        } else if (json.type === 'done') {
+          const doneContent = extractDoneContent(json)
+          if (doneContent) { full = doneContent; return { content: full.trim(), chatId } }
+          if (lastError) throw new Error('Arko error: ' + lastError)
           return { content: full.trim(), chatId }
         }
       } catch {}
     }
+  }
+  if (!full.trim()) {
+    throw new Error(lastError ? 'Arko error: ' + lastError : 'Empty stream from Arko')
   }
   return { content: full.trim(), chatId }
 }
@@ -820,7 +822,35 @@ export async function proxyArko(provider, payload, stream, db, wsTimeoutMs) {
 
   const baseContent = normalizeContent(lastUser?.content)
   const sysContent = normalizeContent(systemMsg?.content)
-  const contentWithSystem = sysContent ? `[System Instructions]\n${sysContent}\n\n${baseContent}` : baseContent
+
+  // Build [System Instructions] context from system message
+  const ctxParts = []
+  if (sysContent) ctxParts.push(sysContent)
+
+  // Collect assistant messages under [Assistant Instructions] block
+  const asstMsgs = []
+  for (const msg of messages) {
+    if (msg.role === 'assistant') {
+      const c = normalizeContent(msg.content)
+      if (c) asstMsgs.push(c)
+    }
+  }
+  if (asstMsgs.length) {
+    ctxParts.push('[Assistant Instructions]\n' + asstMsgs.join('\n\n'))
+  }
+
+  // Build conversation history from previous user messages (exclude last)
+  const prevUserMsgs = []
+  for (const msg of messages) {
+    if (msg.role === 'user' && msg !== lastUser) {
+      const c = normalizeContent(msg.content)
+      if (c) prevUserMsgs.push(c)
+    }
+  }
+
+  const ctxBlock = ctxParts.length ? ctxParts.join('\n\n') : 'You are a helpful AI assistant.'
+  const histBlock = prevUserMsgs.length ? `\n\nConversation history:\nUser: ${prevUserMsgs.join('\nUser: ')}` : ''
+  const contentWithSystem = `[System Instructions]\n${ctxBlock}${histBlock}\n\n${baseContent}`
 
   // Shared arko helpers (need to be before tool result passthrough which uses callArko)
   const url = provider.base_url.replace(/\/+$/, '') + '/v3/messages'
@@ -865,7 +895,7 @@ export async function proxyArko(provider, payload, stream, db, wsTimeoutMs) {
           const row = await db.prepare('SELECT cid FROM chat_cids WHERE ctx_hash = ? AND aid = ?').bind(lookupHash, currentAid).first()
           if (row?.cid) resolvedCid = row.cid
         }
-        const body = { content: sysContent ? `[System Instructions]\n${sysContent}\n\n${prompt}` : prompt, stream: true, aid: currentAid, ...(resolvedCid ? { cid: resolvedCid } : {}) }
+        const body = { content: `[System Instructions]\n${sysContent || 'You are a helpful AI assistant.'}\n\n${prompt}`, stream: true, aid: currentAid, ...(resolvedCid ? { cid: resolvedCid } : {}) }
         const imgTimeout = likelyImageGen(body.content) ? Math.min(wsTimeoutMs || 10000 * 2, 28000) : (wsTimeoutMs || 10000)
         try {
           const resp = await callArko(body, imgTimeout)
