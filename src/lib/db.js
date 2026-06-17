@@ -23,6 +23,28 @@ const likelyImageGen = (content) => {
   return IMAGE_GEN_KEYWORDS.some(kw => c.includes(kw))
 }
 
+// ── AID health tracking (adaptive) ──────────────────────────────
+const aidFailureCount = new Map()
+const AID_BACKOFF_MS = 30000
+
+function markAidFailure(aid) {
+  const now = Date.now()
+  const prev = aidFailureCount.get(aid) || { count: 0, lastFailure: 0 }
+  aidFailureCount.set(aid, { count: prev.count + 1, lastFailure: now })
+}
+
+function markAidSuccess(aid) {
+  aidFailureCount.delete(aid)
+}
+
+function healthyAids(aids) {
+  const now = Date.now()
+  return aids.filter(aid => {
+    const rec = aidFailureCount.get(aid)
+    return !rec || (now - rec.lastFailure) >= AID_BACKOFF_MS
+  })
+}
+
 // ── Schema init & migrations ──────────────────────────────────────
 export async function initDB(db) {
   // Core tables
@@ -185,330 +207,6 @@ export async function updateProvider(db, data) {
     models ? JSON.stringify(models) : '["*"]'
   ).run()
   return await db.prepare('SELECT * FROM config WHERE id = 1').first()
-}
-
-// ── Arko helpers ──────────────────────────────────────────────────
-function extractToolDef(t) {
-  let name, description, parameters
-  if (t.type === 'function' && t.function) {
-    name = t.function.name; description = t.function.description
-    parameters = t.function.parameters || t.function.inputSchema
-  } else if (t.name) {
-    name = t.name; description = t.description || ''; parameters = t.parameters || t.inputSchema
-  } else {
-    return null
-  }
-  return { name, description: description || '', parameters: parameters || {} }
-}
-
-function buildArkoToolPrompt(tools) {
-  if (!tools?.length) return ''
-  const defs = tools.map(extractToolDef).filter(Boolean).map(({ name, description, parameters }) => {
-    const entries = parameters?.properties ? Object.entries(parameters.properties) : []
-    const req = parameters?.required || []
-    const pt = entries.map(([k, v]) => {
-      const r = req.includes(k) ? ' (required)' : ' (optional)'
-      const d = v.description ? ' - ' + v.description : ''
-      return '  ' + k + ': ' + (v.type || 'any') + d + r
-    }).join('\n')
-    return '* ' + name + (description ? ': ' + description : '') + '\n' + (pt || '  (no parameters)')
-  }).join('\n\n')
-  if (!defs) return ''
-  return 'IMPORTANT: You MUST use these tools when asked. Output ONLY this JSON format:\n' +
-    '{"name":"<tool_name>","arguments":{...}}\n\nAvailable tools:\n' + defs + '\n\n' +
-    'Respond with ONLY the JSON above, no other text.'
-}
-
-function tryExtractToolCall(text, tools) {
-  if (!text) return null
-  const tryParse = (str) => {
-    try {
-      const o = JSON.parse(str)
-      // Match extracted tool name against actual tool names (support short names from LLM)
-      const resolveToolName = (extracted) => {
-        if (!tools?.length || !extracted) return extracted
-        const toolNames = tools.map(t => { const d = extractToolDef(t); return d?.name }).filter(Boolean)
-        const e = String(extracted)
-        if (toolNames.includes(e)) return e
-        // Suffix match: arko might return "web_search_exa" without "PluggedinMCP_exa-search__"
-        const suffix = toolNames.find(tn => tn.endsWith(e) || tn.endsWith('__' + e) || tn.toLowerCase().endsWith(e.toLowerCase()))
-        if (suffix) return suffix
-        // Normalized fuzzy match
-        const norm = e.toLowerCase().replace(/[^a-z0-9]/g, '')
-        const fuzzy = toolNames.find(tn => tn.toLowerCase().replace(/[^a-z0-9]/g, '') === norm)
-        if (fuzzy) return fuzzy
-        return e // keep original as fallback
-      }
-
-      if (o.name && o.arguments) {
-        const id = 'call_' + (crypto.randomUUID()?.slice(0, 8) || Math.random().toString(36).slice(2, 10))
-        const name = resolveToolName(o.name)
-        return { id, type: 'function', function: { name, arguments: JSON.stringify(o.arguments) } }
-      }
-      if (o.call && typeof o.call === 'string') {
-        const { call, ...args } = o
-        const id = 'call_' + (crypto.randomUUID()?.slice(0, 8) || Math.random().toString(36).slice(2, 10))
-        const name = resolveToolName(call)
-        return { id, type: 'function', function: { name, arguments: JSON.stringify(args) } }
-      }
-    } catch {}
-    return null
-  }
-  const cleaned = text.replace(/```(?:json)?\s*([\s\S]*?)```/g, '$1').trim()
-  let r = tryParse(cleaned)
-  if (r) return r
-  // Scan for top-level JSON objects
-  for (let i = 0; i < cleaned.length; i++) {
-    if (cleaned[i] === '{') {
-      let depth = 1, j = i + 1
-      while (j < cleaned.length && depth > 0) {
-        if (cleaned[j] === '{') depth++
-        else if (cleaned[j] === '}') depth--
-        j++
-      }
-      if (depth === 0) {
-        r = tryParse(cleaned.slice(i, j))
-        if (r) return r
-      }
-    }
-  }
-  return null
-}
-
-// ── Tool intent scoring (metadata-only, no hardcoded mappings) ────
-const INTENT_SYNONYMS = [
-  ['look up', 'search'], ['lookup', 'search'],
-  ['find out', 'search'], ['find', 'search'],
-  ['fetch', 'search'], ['retrieve', 'search'],
-  ['query', 'search'], ['check', 'search'],
-  ['get', 'search'], ['tell me about', 'search'],
-  ['run', 'execute'], ['launch', 'execute'],
-  ['start', 'execute'],
-  // Chinese synonyms
-  ['搜尋', 'search'], ['搜索', 'search'], ['查詢', 'search'],
-  ['查', 'search'], ['找', 'search'],
-  ['獲取', 'fetch'], ['取得', 'fetch'], ['下載', 'fetch'],
-  ['打開', 'open'], ['開啟', 'open'],
-  ['分析', 'analyze'], ['總結', 'summarize'],
-  ['天氣', 'weather'], ['新聞', 'news'],
-]
-
-function scoreToolRelevance(def, msg) {
-  let score = 0
-  const name = def.name.toLowerCase().replace(/_/g, ' ')
-  const desc = (def.description || '').toLowerCase()
-  const allMeta = name + ' ' + desc +
-    (def.parameters?.properties ? ' ' + Object.keys(def.parameters.properties).join(' ') : '')
-  const nameWords = [...new Set(name.split(/[_\s-]+/).filter(w => w.length > 2))]
-  for (const w of nameWords) { if (msg.includes(w)) score += 15 }
-  if (def.parameters?.properties) {
-    const seen = new Set()
-    for (const p of Object.keys(def.parameters.properties)) {
-      const pk = p.toLowerCase()
-      if (pk.length > 2 && !seen.has(pk) && msg.includes(pk)) { score += 10; seen.add(pk) }
-    }
-  }
-  const descWords = [...new Set(desc.split(/\s+/).filter(w => w.length > 3))]
-  for (const w of descWords) { if (msg.includes(w)) score += 3 }
-  for (const [phrase, keyword] of INTENT_SYNONYMS) {
-    if (msg.includes(phrase)) {
-      const kw = keyword.toLowerCase()
-      if (nameWords.some(w => w.includes(kw) || kw.includes(w)) ||
-          descWords.some(w => w.includes(kw) || kw.includes(w)) ||
-          allMeta.includes(kw)) score += 8
-    }
-  }
-  // URL-aware adjustment: detect if the message contains actual URLs
-  if (def.parameters?.properties) {
-    const paramKeys = Object.keys(def.parameters.properties).map(k => k.toLowerCase())
-    const hasUrlParam = paramKeys.some(k => ['url','urls','link','links','uri'].includes(k))
-    const hasQueryParam = paramKeys.some(k => ['query','q','search','keyword'].includes(k))
-    const hasUrlsInMsg = /https?:\/\/[^\s,;)]+/i.test(msg)
-    if (hasUrlsInMsg && hasUrlParam) {
-      score += 3  // message has URLs and tool accepts URLs → prefer it
-    } else if (!hasUrlsInMsg) {
-      if (hasUrlParam && !hasQueryParam) score -= 5  // pure fetch tool without URLs → penalize
-      if (hasQueryParam) score += 3  // search-like tool when no URLs → prefer
-    }
-  }
-  return score
-}
-
-function userIntendsTool(userMsg, tools) {
-  if (!userMsg || !tools?.length) return false
-  const msg = userMsg.trim().toLowerCase()
-  if (/^(hi|hello|hey|嗨|你好|您好|哈囉|yo|sup)[\s!\.]*$/i.test(msg)) return false
-  if (/^(good morning|good afternoon|good evening|how are you|how do you do|what's up|nice to meet you)[\s!\.]*$/i.test(msg)) return false
-  if (msg.length < 3) return false
-  for (const t of tools) {
-    const d = extractToolDef(t)
-    if (!d) continue
-    if (scoreToolRelevance(d, msg) >= 8) return true
-  }
-  return false
-}
-
-const _STOP = new Set(['the','and','for','with','from','that','this','what','when','where','which','have','has','not','but','are','was','were','been','does','did','get','got','its','our','their','your','all','can','just','very','also','more','some','any','each','every','both','few','many','much','than','then','into','over','after','before','between','through','during','against','without','within','along','about','around','down','off','above','below','out','up','how','why','who','whom','whose'])
-
-function generateMockToolCall(tools, userMsg) {
-  if (!tools?.length) return null
-  const msg = (userMsg || '').toLowerCase().trim()
-  const rawMsg = (userMsg || '').trim()
-  let best = null, bestScore = -1
-  for (const t of tools) {
-    const d = extractToolDef(t)
-    if (!d) continue
-    const s = scoreToolRelevance(d, msg)
-    if (s > bestScore) { bestScore = s; best = d }
-  }
-  if (bestScore < 8) return null
-  if (!best) { best = extractToolDef(tools[0]); if (!best) return null }
-
-  const required = new Set(best.parameters?.required || [])
-  const argsObj = {}
-  if (best.parameters?.properties) {
-    const msgWords = msg.split(/\s+/).filter(Boolean)
-    const contentWords = msgWords.filter(w => w.length > 2 && !_STOP.has(w))
-    const urlsFound = rawMsg.match(/https?:\/\/[^\s,;)]+/g) || []
-
-    for (const [k, v] of Object.entries(best.parameters.properties)) {
-      const type = v.type || 'string'
-      const pk = k.toLowerCase()
-      const isReq = required.has(k)
-      let value = null
-
-      if (type === 'string') {
-        // Enum: use first allowed value
-        if (v.enum?.length) {
-          value = v.enum[0]
-        } else if (v.format === 'uuid' || pk.includes('uuid') || pk === 'session_id' || pk.endsWith('_uuid')) {
-          value = crypto.randomUUID?.() || '00000000-0000-0000-0000-000000000000'
-        } else if (v.format === 'email' || pk.includes('email')) {
-          value = 'user@example.com'
-        } else if (v.format === 'uri' || v.format === 'url' || pk === 'url' || pk === 'uri') {
-          value = urlsFound[0] || 'https://example.com'
-        } else if (v.format === 'date-time' || v.format === 'date') {
-          value = new Date().toISOString()
-        } else if (v.format === 'ipv4') {
-          value = '127.0.0.1'
-        } else if (v.format === 'ipv6') {
-          value = '::1'
-        } else if (v.pattern) {
-          value = rawMsg.slice(0, 100) || 'test'
-        } else if (['query','q','search','keyword'].includes(pk)) {
-          const ai = msgWords.findIndex(w => ['search','find','look','query','fetch','get','for','about','on'].includes(w))
-          if (ai >= 0 && ai + 1 < msgWords.length) value = msgWords.slice(ai + 1).join(' ')
-          else if (contentWords.length) value = contentWords.join(' ')
-        } else if (['url','link','path','file','filename','name','id','title'].includes(pk)) {
-          if (urlsFound.length) value = urlsFound[0]
-          else {
-            const pm = msg.match(/[\/\w\-.]+\.[a-z]{2,}(?:\/[^\s]*)?/)
-            if (pm) value = pm[0]
-            else if (contentWords.length) value = contentWords.slice(0, 3).join(' ')
-          }
-        } else if (['command','cmd'].includes(pk)) {
-          const cm = msg.match(/(?:run|execute|command)\s+(.+)/i)
-          if (cm) value = cm[1].trim()
-        }
-        if (!value && contentWords.length) value = contentWords.join(' ').slice(0, 500)
-        else if (!value) value = rawMsg.slice(0, 500)
-                if (value && !v.enum) value = value.replace(/^(?:for |about |on |command |run |execute |search |find |look up |fetch |check |get |搜尋|搜索|查詢|查|找|獲取|取得|下載|打開|開啟|分析|總結)/i, '').trim()
-        // Min/Max length clamp
-        if (value) {
-          if (v.maxLength && value.length > v.maxLength) value = value.slice(0, v.maxLength)
-          if (v.minLength && value.length < v.minLength) value = value.padEnd(v.minLength, 'x').slice(0, v.minLength)
-        }
-        if (!value) value = isReq ? 'test' : ''
-      } else if (type === 'array') {
-        if (['urls','links','ids'].includes(pk) && urlsFound.length) {
-          value = urlsFound
-        } else {
-          const itemType = v.items?.type || 'string'
-          let items = []
-          if (itemType === 'object') {
-            // Generate stub object with required sub-properties
-            const stub = {}
-            if (v.items?.properties) {
-              for (const [sk, sv] of Object.entries(v.items.properties)) {
-                const sReq = v.items.required?.includes(sk)
-                const sr = sv.type || 'string'
-                if (sr === 'string') stub[sk] = sv.enum?.[0] || (sReq ? sk : '')
-                else if (sr === 'number' || sr === 'integer') stub[sk] = sv.minimum || 1
-                else if (sr === 'boolean') stub[sk] = true
-                else stub[sk] = null
-              }
-            }
-            items = [stub]
-          } else {
-            items = contentWords.length ? contentWords.slice(0, 5) : []
-            if (!items.length && isReq) items.push(rawMsg.slice(0, 100) || 'test')
-          }
-          value = items
-        }
-        // MinItems clamp
-        if (v.minItems && value.length < v.minItems) {
-          const fill = value.length ? value[0] : 'item'
-          while (value.length < v.minItems) value.push(typeof fill === 'object' ? {...fill} : fill)
-        }
-      } else if (type === 'number' || type === 'integer') {
-        const nm = msg.match(/\d+/)
-        const min = v.minimum !== undefined ? v.minimum : -Infinity
-        const max = v.maximum !== undefined ? v.maximum : Infinity
-        const defVal = v.default !== undefined ? v.default : null
-        if (nm) {
-          value = parseInt(nm[0], 10)
-          if (value < min) value = min
-          if (value > max) value = max
-        } else if (defVal !== null) {
-          value = defVal
-        } else {
-          value = isReq ? (min > -Infinity ? min : 1) : (min > -Infinity ? min : null)
-        }
-      } else if (type === 'boolean') {
-        value = pk.includes('dis') || pk.includes('hide') || pk.includes('disable') ? false : true
-      } else if (type === 'object') {
-        // Generate stub with sub-properties
-        const stub = {}
-        if (v.properties) {
-          for (const [sk, sv] of Object.entries(v.properties)) {
-            const sReq = v.required?.includes(sk)
-            const sr = sv.type || 'string'
-            if (sr === 'string') stub[sk] = sv.enum?.[0] || (sReq ? sk : '')
-            else if (sr === 'number' || sr === 'integer') stub[sk] = sv.minimum || 1
-            else if (sr === 'boolean') stub[sk] = true
-            else if (sr === 'array') stub[sk] = []
-            else if (sr === 'object') stub[sk] = {}
-          }
-        }
-        value = Object.keys(stub).length ? stub : {}
-      }
-
-      if (value === null) {
-        if (isReq) value = '' // will be caught by final check
-        else continue // skip optional params with no value
-      }
-      argsObj[k] = value
-    }
-  }
-  // ── Random UUID guard ──
-  // If a required param was filled with a randomly-generated UUID (not from user msg),
-  // skip mock — the referenced resource won't exist server-side.
-  if (required.size > 0) {
-    const msgHasUuid = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(msg)
-    if (!msgHasUuid) {
-      for (const k of required) {
-        const val = argsObj[k]
-        if (typeof val === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val)) {
-          return null // skip mock — UUID can't match a real resource
-        }
-      }
-    }
-  }
-  const a = Object.keys(argsObj).length ? JSON.stringify(argsObj) : '{}'
-  return {
-    id: 'call_' + (crypto.randomUUID?.()?.slice(0, 8) || Math.random().toString(36).slice(2, 10)),
-    type: 'function', function: { name: best.name, arguments: a }
-  }
 }
 
 // ── Arko stream parsing ──────────────────────────────────────────
@@ -753,15 +451,10 @@ function streamArkoToSSE(response, model, sid, cid, db, allUserMsgs, currentAid,
 // ── OpenAI response formatters ────────────────────────────────────
 function makeCompletionId() { return 'chatcmpl-' + (crypto.randomUUID()?.slice(0, 8) || Math.random().toString(36).slice(2, 10)) }
 
-function openAIStreamResponse(model, text, toolCall, cid) {
+function openAIStreamResponse(model, text, cid) {
   const enc = new TextEncoder(); const { readable, writable } = new TransformStream()
   const w = writable.getWriter(); const sid = makeCompletionId()
-  const chunks = toolCall ? [
-    { choices: [{ index: 0, delta: { role: 'assistant', content: null }, finish_reason: null }] },
-    { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: toolCall.id, type: 'function', function: { name: toolCall.function.name, arguments: '' } }] }, finish_reason: null }] },
-    { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: toolCall.function.arguments } }] }, finish_reason: null }] },
-    { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }
-  ] : [
+  const chunks = [
     { choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] },
     { choices: [{ index: 0, delta: { content: text }, finish_reason: null }] },
     { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }
@@ -780,14 +473,11 @@ function openAIStreamResponse(model, text, toolCall, cid) {
   })
 }
 
-function openAICompletion(model, text, toolCall, cid) {
-  const msg = toolCall
-    ? { role: 'assistant', content: null, tool_calls: [toolCall] }
-    : { role: 'assistant', content: text }
+function openAICompletion(model, text, cid) {
   return {
     id: makeCompletionId(), object: 'chat.completion', created: Math.floor(Date.now() / 1000),
     model, usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-    choices: [{ index: 0, message: msg, finish_reason: toolCall ? 'tool_calls' : 'stop' }],
+    choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
     ...(cid ? { _cid: cid } : {})
   }
 }
@@ -799,16 +489,9 @@ let aidRotateCounter = 0
 
 export async function proxyArko(provider, payload, stream, db, wsTimeoutMs) {
   const messages = payload.messages || []
-  const tools = payload.tools || payload.functions || []
-  const hasTools = !!(tools.length)
-  const lastMsg = messages[messages.length - 1] || {}
   const model = payload.model || 'arko'
   const aid = provider.upstream_model
   if (!aid) throw new Error('Arko provider has no upstream_model configured')
-  const toolChoice = payload.tool_choice
-  const toolsActive = hasTools && toolChoice !== 'none'
-
-  // Tool intent detection
   const lastUser = [...messages].reverse().find(m => m.role === 'user')
   const systemMsg = messages.find(m => m.role === 'system')
 
@@ -852,7 +535,6 @@ export async function proxyArko(provider, payload, stream, db, wsTimeoutMs) {
   const histBlock = prevUserMsgs.length ? `\n\nConversation history:\nUser: ${prevUserMsgs.join('\nUser: ')}` : ''
   const contentWithSystem = `[System Instructions]\n${ctxBlock}${histBlock}\n\n${baseContent}`
 
-  // Shared arko helpers (need to be before tool result passthrough which uses callArko)
   const url = provider.base_url.replace(/\/+$/, '') + '/v3/messages'
   const headers = { 'Content-Type': 'application/json' }
   if (provider.api_key) headers['Authorization'] = 'Bearer ' + provider.api_key
@@ -867,197 +549,17 @@ export async function proxyArko(provider, payload, stream, db, wsTimeoutMs) {
     } finally { clearTimeout(timer) }
   }
 
-  // Tool result passthrough: route to Arko with context instead of raw passthrough
-  if (lastMsg.role === 'tool') {
-    const toolResult = normalizeContent(lastMsg.content) || ''
-    const lastAssistant = [...messages].reverse().find(m => m.role === 'assistant' && m.tool_calls)
-    const origUser = [...messages].reverse().find(m => m.role === 'user')
-    const origContent = normalizeContent(origUser?.content || '')
-    const toolName = lastAssistant?.tool_calls?.[0]?.function?.name || 'unknown'
-    const toolArgs = lastAssistant?.tool_calls?.[0]?.function?.arguments || '{}'
-    const prompt = `[User request: ${origContent}]\n[Tool called: ${toolName} with args: ${toolArgs}]\n[Tool result: ${toolResult}]\nRespond to the user in natural language based on this result. If the result is empty, say the tool returned nothing.`
-    const allUserMsgs = messages.filter(m => m.role === 'user').map(m => normalizeContent(m.content))
-    const prevMsgs = allUserMsgs.slice(0, allUserMsgs.length - (messages[messages.length - 1]?.role === 'user' ? 1 : 0))
-    const aids = aid.split(',').map(s => s.trim()).filter(Boolean)
-    if (!aids.length) throw new Error('No valid AIDs configured')
-    let lastErr = null
-    const toolStart = Date.now()
-    for (let cycle = 0; cycle < 3; cycle++) {
-      if (Date.now() - toolStart >= 25000) break
-      for (const currentAid of aids) {
-        const now = Date.now()
-        const lastTime = lastArkoCall.get(currentAid) || 0
-        if (now - lastTime < 1000) await sleep(1000 - (now - lastTime))
-        lastArkoCall.set(currentAid, Date.now())
-        let resolvedCid = payload.cid || null
-        if (db && !resolvedCid && prevMsgs.length) {
-          const hashStr = JSON.stringify(prevMsgs)
-          const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(hashStr))
-          const lookupHash = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 64)
-          const row = await db.prepare('SELECT cid FROM chat_cids WHERE ctx_hash = ? AND aid = ?').bind(lookupHash, currentAid).first()
-          if (row?.cid) resolvedCid = row.cid
-        }
-        if (Date.now() - toolStart >= 25000) break
-        const body = { content: `[System Instructions]\n${sysContent || 'You are a helpful AI assistant.'}\n\n${prompt}`, stream: true, aid: currentAid, ...(resolvedCid ? { cid: resolvedCid } : {}) }
-        const imgTimeout = likelyImageGen(body.content) ? Math.min(wsTimeoutMs || 10000 * 2, 28000) : (wsTimeoutMs || 10000)
-        try {
-          const resp = await callArko(body, imgTimeout)
-          const parsed = await readArkoStream(resp)
-          if (parsed.content) {
-            if (db && parsed.chatId && prevMsgs.length) {
-              const hashStr = JSON.stringify(prevMsgs)
-              const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(hashStr))
-              const ctxHash2 = Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 64)
-              try { await saveChatCid(db, ctxHash2, parsed.chatId, currentAid) } catch {}
-            }
-            return stream ? openAIStreamResponse(model, parsed.content, null, parsed.chatId || payload.cid) : openAICompletion(model, parsed.content, null, parsed.chatId || payload.cid)
-          }
-        } catch (e) {
-          lastErr = e
-        }
-        const backoff = [500, 1000, 2000][Math.min(cycle, 2)]
-        await sleep(backoff)
-      }
-    }
-    throw new Error('Arko returned empty content for tool result' + (lastErr ? ': ' + lastErr.message : ''))
-  }
-
-  // Build tool descriptions (shared between tool and non-tool paths)
-  let toolDesc = ''
-  if (toolsActive && tools.length) {
-    toolDesc = tools.map(t => {
-      const d = extractToolDef(t)
-      if (!d) return ''
-      const params = d.parameters?.properties
-        ? Object.entries(d.parameters.properties).map(([k, v]) => `    ${k} (${v.type || 'any'})${v.description ? ': ' + v.description : ''}`).join('\n')
-        : ''
-      return `- ${d.name}${d.description ? ': ' + d.description : ''}\n${params}`
-    }).filter(Boolean).join('\n')
-  }
-
-  // Validate non-empty message content before calling Arko API
-  if (!contentWithSystem?.trim() && !toolsActive) {
-    throw new Error('Message content is empty — provide a user message')
-  }
-
-  const cleanParam = (v) => typeof v === 'string' ? v.replace(/^(?:for |about |on |command |run |execute |search |find |look up |fetch |check |get )/i, '').trim() : v
-  const returnToolCall = (tc, cid) => {
-    const args = JSON.parse(tc.function.arguments)
-    // Sanitize args against tool schema constraints
-    const tcDef = tools.find(t => { const d = extractToolDef(t); return d && d.name === tc.function.name })
-    if (tcDef) {
-      const def = extractToolDef(tcDef)
-      if (def?.parameters?.properties) {
-        for (const [k, v] of Object.entries(def.parameters.properties)) {
-          if (!(k in args)) continue
-          const val = args[k]
-          const st = v.type || 'string'
-          if ((st === 'number' || st === 'integer') && typeof val === 'number') {
-            const min = v.minimum !== undefined ? v.minimum : -Infinity
-            const max = v.maximum !== undefined ? v.maximum : Infinity
-            let adj = val
-            if (adj < min) adj = min
-            if (adj > max) adj = max
-            if (adj !== val) args[k] = adj
-          } else if (st === 'string' && typeof val === 'string') {
-            // Enum clamp
-            if (v.enum?.length && !v.enum.includes(val)) {
-              args[k] = v.enum[0]
-            }
-            // Min/Max length
-            if (v.minLength && val.length < v.minLength) args[k] = val.padEnd(v.minLength, 'x').slice(0, v.minLength)
-            if (v.maxLength && val.length > v.maxLength) args[k] = val.slice(0, v.maxLength)
-          } else if (st === 'array' && Array.isArray(val)) {
-            // Clamp array minItems/maxItems
-            if (v.minItems && val.length < v.minItems) {
-              const fill = val.length ? val[0] : 'item'
-              while (val.length < v.minItems) val.push(fill)
-            }
-            if (v.maxItems) val.splice(v.maxItems)
-            // Ensure items match item schema
-            if (v.items?.type && val.length) {
-              for (let i = 0; i < val.length; i++) {
-                if (v.items.type === 'object' && typeof val[i] === 'string') {
-                  try { val[i] = JSON.parse(val[i]) } catch { val[i] = {} }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-    for (const k of Object.keys(args)) args[k] = cleanParam(args[k])
-    tc.function.arguments = JSON.stringify(args)
-    const mt = JSON.stringify({ name: tc.function.name, arguments: args })
-    return stream ? openAIStreamResponse(model, mt, tc, cid || payload.cid) : openAICompletion(model, mt, tc, cid || payload.cid)
-  }
-  const returnText = (text, cid) =>
-    stream ? openAIStreamResponse(model, text, null, cid || payload.cid) : openAICompletion(model, text, null, cid || payload.cid)
-
-  // Tool path: arko-aware extraction + metadata fallback
-  if (toolsActive && userIntendsTool(baseContent, tools)) {
-    // Phase 1: Ask arko (aware + extract combined)
-    if (toolDesc) {
-      const recentHistory = messages.slice(-5).map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n')
-      const ep = `You are a parameter extraction assistant. Extract the tool call parameters from the user's request.\n\n` +
-        `Available tools:\n${toolDesc}\n\n` +
-        `Rules:\n` +
-        `- Respond with ONLY valid JSON, no other text\n` +
-        `- Format: {"name":"<exact_tool_name>","arguments":{<param>:<value>,...}}\n` +
-        `- Extract actual values from the user request (e.g. if user says "search for cats", query should be "cats")\n` +
-        `- If user provided a URL, include it exactly as given\n` +
-        `- If a parameter is not mentioned in the request, guess a reasonable value\n` +
-        `- If the user's intent does NOT match any tool, respond normally as a helpful assistant\n\n` +
-        `Conversation History:\n${recentHistory}\n\nExtract parameters for the final User request.`
-      try {
-        const resp = await callArko({ content: ep, stream: true, aid }, wsTimeoutMs || 10000)
-        const parsed = await readArkoStream(resp)
-        const tc = tryExtractToolCall(parsed.content || '', tools)
-          if (tc) {
-            // Merge Phase 1 result with mock-generated fallback for missing/empty params
-            const mockTc = generateMockToolCall(tools, baseContent)
-            if (mockTc) {
-              const p1 = JSON.parse(tc.function.arguments)
-              const mockArgs = JSON.parse(mockTc.function.arguments)
-              // Build schema constraint map for this tool
-              const tcDef = tools.find(t => { const d = extractToolDef(t); return d && d.name === tc.function.name })
-              const schemaProps = tcDef ? (extractToolDef(tcDef)?.parameters?.properties || {}) : {}
-              for (const [k, val] of Object.entries(p1)) {
-                // Keep Phase 1 value if non-empty; fall back to mock's value
-                const isEmpty = val === '' || val === null || val === undefined || (Array.isArray(val) && val.length === 0)
-                // Also replace if number violates minimum constraint
-                const prop = schemaProps[k]
-                const isNumViolation = !isEmpty && typeof val === 'number' && prop && (prop.type === 'number' || prop.type === 'integer') &&
-                  prop.minimum !== undefined && val < prop.minimum
-                if (isEmpty || isNumViolation) {
-                  if (mockArgs[k] !== undefined) p1[k] = mockArgs[k]
-                }
-              }
-              // Copy any params from mock that Phase 1 missed
-              for (const [k, val] of Object.entries(mockArgs)) {
-                if (!(k in p1) && val !== undefined && val !== null && val !== '') {
-                  p1[k] = val
-                }
-              }
-              tc.function.arguments = JSON.stringify(p1)
-            }
-          return returnToolCall(tc, parsed.chatId)
-        }
-      } catch (e) { console.error('Tool extraction failed:', e) }
-    }
-    // Phase 2: Metadata extraction fallback
-    const tc = generateMockToolCall(tools, baseContent)
-    if (tc) return returnToolCall(tc, payload.cid)
-    return returnText('[無法解析工具請求，請重新描述]', payload.cid)
-  }
-
-  // Tool awareness questions
-  if (toolsActive && toolDesc && /what (tools?|can you)|capabilities|功能|工具有哪些/i.test(baseContent)) {
-    return returnText('I have these tools available through my proxy:\n' + toolDesc, payload.cid)
+  if (!contentWithSystem?.trim()) {
+    throw new Error('Message content is empty')
   }
 
   // Non-tool path: plain text to arko
-  const aids = aid.split(',').map(s => s.trim()).filter(Boolean)
+  const aids = healthyAids(aid.split(',').map(s => s.trim()).filter(Boolean))
+  // If all AIDs are unhealthy, reset and try all
+  if (!aids.length) {
+    aidFailureCount.clear()
+    aids.push(...aid.split(',').map(s => s.trim()).filter(Boolean))
+  }
   const allUserMsgs = messages.filter(m => m.role === 'user').map(m => normalizeContent(m.content))
 
   // Compute saveHash from ALL user messages (for saving CID at end of this turn)
@@ -1089,17 +591,17 @@ export async function proxyArko(provider, payload, stream, db, wsTimeoutMs) {
 
   let lastErr = null
   const isImageGen = likelyImageGen(contentWithSystem)
-  const maxCycles = isImageGen ? 1 : 3
-  const MAX_DURATION_MS = 25000
+  const MAX_DURATION_MS = 29500
   const startTime = Date.now()
-  const callTimeout = isImageGen ? Math.min((wsTimeoutMs || 8000) * 2, 28000) : (wsTimeoutMs || 8000)
-  const attemptAids = isImageGen ? [aidOrder[0]].filter(Boolean) : aidOrder
-  for (let cycle = 0; cycle < maxCycles; cycle++) {
-    if (Date.now() - startTime >= MAX_DURATION_MS) break
-    for (const currentAid of attemptAids) {
+  const callTimeout = Math.min(wsTimeoutMs || 8000, isImageGen ? 15000 : 8000)
+
+  while (Date.now() - startTime < MAX_DURATION_MS) {
+    for (const currentAid of aidOrder) {
+      if (Date.now() - startTime >= MAX_DURATION_MS) break
+
       const now = Date.now()
       const lastTime = lastArkoCall.get(currentAid) || 0
-      if (now - lastTime < 1000) await sleep(1000 - (now - lastTime))
+      if (now - lastTime < 500) await sleep(500 - (now - lastTime))
       lastArkoCall.set(currentAid, Date.now())
 
       let resolvedCid = payload.cid || null
@@ -1108,28 +610,26 @@ export async function proxyArko(provider, payload, stream, db, wsTimeoutMs) {
         if (row?.cid) resolvedCid = row.cid
       }
 
-      if (Date.now() - startTime >= MAX_DURATION_MS) break
       const body = { content: contentWithSystem, stream: true, aid: currentAid, ...(resolvedCid ? { cid: resolvedCid } : {}) }
       try {
         const resp = await callArko(body, callTimeout)
-
-        // Always read full NDJSON to validate content before returning
         const parsed = await readArkoStream(resp)
         if (parsed.content) {
           if (db && parsed.chatId && ctxHash) {
             try { await saveChatCid(db, ctxHash, parsed.chatId, currentAid) } catch {}
           }
-          if (stream) return openAIStreamResponse(model, parsed.content, null, parsed.chatId || payload.cid)
-          return openAICompletion(model, parsed.content, null, parsed.chatId || payload.cid)
+          markAidSuccess(currentAid)
+          if (stream) return openAIStreamResponse(model, parsed.content, parsed.chatId || payload.cid)
+          return openAICompletion(model, parsed.content, parsed.chatId || payload.cid)
         }
       } catch (e) {
         lastErr = e
         const status = e.message?.match(/Arko HTTP (\d+)/)?.[1] || 'unknown'
-        console.error(`Arko attempt failed (aid=${currentAid.slice(0,8)} status=${status} cycle=${cycle + 1}):`, e.message?.slice(0, 200))
+        markAidFailure(currentAid)
+        console.error(`Arko attempt failed (aid=${currentAid.slice(0,8)} status=${status}):`, e.message?.slice(0, 200))
       }
 
-      const backoff = [500, 1000, 2000][Math.min(cycle, 2)]
-      await sleep(backoff)
+      await sleep(500)
     }
   }
   throw new Error('Arko returned empty content after retries' + (lastErr ? ': ' + lastErr.message : ''))
